@@ -1,0 +1,106 @@
+# SignalsBrain Configuration
+# DO NOT commit with real API keys — use environment variables in production.
+
+server:
+  host: "0.0.0.0"
+  port: 8400
+  workers: 2
+
+auth:
+  api_key: "${SIGNALSBRAIN_API_KEY:-dev-key-change-me}"
+
+instruments:
+  indices:
+    - NIFTY
+    - BANKNIFTY
+    - FINNIFTY
+    - MIDCPNIFTY
+  stocks:
+    - RELIANCE
+    - HDFCBANK
+    - ICICIBANK
+    - INFY
+    - TCS
+    - SBIN
+    - BHARTIARTL
+    - ITC
+    - KOTAKBANK
+    - LT
+    - AXISBANK
+    - TATAMOTORS
+    - MARUTI
+    - WIPRO
+    - HCLTECH
+    - ADANIENT
+    - BAJFINANCE
+    - TITAN
+
+market:
+  timezone: "Asia/Kolkata"
+  open_time: "09:15"
+  close_time: "15:30"
+  pre_open: "09:00"
+
+data_source:
+  # Primary: existing proxy at ads.sanctify.co.in
+  proxy_url: "https://ads.sanctify.co.in/signals/api/proxy.php"
+  # Polling intervals (seconds)
+  normal_interval: 30
+  rapid_interval: 10  # When a setup is building
+  
+strike_steps:
+  NIFTY: 50
+  BANKNIFTY: 100
+  FINNIFTY: 50
+  SENSEX: 100
+  MIDCPNIFTY: 25
+
+lot_sizes:
+  NIFTY: 75
+  BANKNIFTY: 30
+  FINNIFTY: 65
+  SENSEX: 20
+  MIDCPNIFTY: 120
+  RELIANCE: 500
+  HDFCBANK: 550
+  ICICIBANK: 700
+  INFY: 400
+  TCS: 175
+  SBIN: 750
+  BHARTIARTL: 475
+  ITC: 1600
+  KOTAKBANK: 400
+  LT: 150
+  AXISBANK: 625
+  TATAMOTORS: 550
+  MARUTI: 50
+  WIPRO: 3000
+  HCLTECH: 350
+  ADANIENT: 300
+  BAJFINANCE: 750
+  TITAN: 175
+
+trading:
+  capital: 200000  # ₹2L default
+  max_lots: 5
+  max_signals_per_day: 3
+  circuit_breaker_stops: 2
+  risk_per_trade_pct: 2.0
+
+# AI model endpoints for GodMode multi-model consensus
+ai_models:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    model: "gpt-4o"
+    api_key: "${OPENAI_API_KEY:-}"
+  anthropic:
+    base_url: "https://api.anthropic.com"
+    model: "claude-sonnet-4-20250514"
+    api_key: "${ANTHROPIC_API_KEY:-}"
+  gemini:
+    model: "gemini-2.0-flash"
+    api_key: "${GEMINI_API_KEY:-}"
+  openrouter:
+    base_url: "https://openrouter.ai/api/v1"
+    model: "anthropic/claude-sonnet-4-20250514"
+    api_key: "${OPENROUTER_API_KEY:-}"

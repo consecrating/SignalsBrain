@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "signalsbrain"
+version = "1.0.0"
+description = "God Mode intelligence layer for Indian F&O markets. 47-dimension state engine + pattern memory + reasoning chains + universal AI model connector."
+readme = "README.md"
+license = {text = "Proprietary"}
+requires-python = ">=3.11"
+authors = [{name = "consecrating"}]
+
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.6.0",
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+    "pyyaml>=6.0",
+    "python-jose[cryptography]>=3.3.0",
+]
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0.0",
+]
+ai = [
+    "openai>=1.12.0",
+    "anthropic>=0.18.0",
+    "google-generativeai>=0.4.0",
+]
+full = [
+    "signalsbrain[mcp,ai]",
+]
+
+[project.scripts]
+signalsbrain = "api.main:run"
