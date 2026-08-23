@@ -178,7 +178,10 @@ class BrainRuntime:
 
     def get_state_object(self, instrument: str, *, require_fresh: bool = False) -> MarketState:
         instrument = instrument.upper()
-        state = self.state_cache.get(instrument)
+        # Decision paths reconcile with durable state on every call so REST,
+        # MCP, and other adapters cannot disagree when another process ingests
+        # a newer snapshot. refresh_snapshot keeps a newer in-memory state.
+        state = self.refresh_snapshot(instrument) if require_fresh else self.state_cache.get(instrument)
         if state is None:
             state = self.refresh_snapshot(instrument)
         if state is None:

@@ -822,3 +822,23 @@ def test_idempotent_no_trade_persists_decision_and_audit_atomically(tmp_path: Pa
         assert connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM decisions WHERE operation='signal'").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM audit_events WHERE event_type='signal_evaluated'").fetchone()[0] == 1
+
+
+def test_decision_paths_refresh_newer_persisted_snapshot(tmp_path: Path):
+    db_path = tmp_path / "patterns.db"
+    runtime = BrainRuntime(
+        db_path,
+        learnings_path=tmp_path / "learnings.json",
+        decision_max_age_seconds=30,
+    )
+    stale = make_state()
+    stale.timestamp = time.time() - 120
+    runtime.state_cache["NIFTY"] = stale
+
+    fresh = make_state()
+    fresh.timestamp = time.time()
+    PatternDB(db_path).record_state_snapshot(fresh, fresh.quality_dict())
+
+    resolved = runtime.get_state_object("NIFTY", require_fresh=True)
+    assert resolved.timestamp == fresh.timestamp
+    assert runtime.state_cache["NIFTY"].timestamp == fresh.timestamp
