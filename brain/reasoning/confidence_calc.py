@@ -45,6 +45,9 @@ class ConfidenceBreakdown:
     
     evidence_quality_modifier: float = 0.0
     evidence_quality_explanation: str = ""
+
+    coverage_modifier: float = 0.0
+    coverage_explanation: str = ""
     
     penalty_total: float = 0.0
     bonus_total: float = 0.0
@@ -60,6 +63,7 @@ class ConfidenceBreakdown:
             "velocity": {"value": round(self.velocity_modifier, 1), "reason": self.velocity_explanation},
             "mtf": {"value": round(self.mtf_modifier, 1), "reason": self.mtf_explanation},
             "evidence_quality": {"value": round(self.evidence_quality_modifier, 1), "reason": self.evidence_quality_explanation},
+            "coverage": {"value": round(self.coverage_modifier, 1), "reason": self.coverage_explanation},
             "final": round(self.final, 1),
         }
 
@@ -80,6 +84,7 @@ class ConfidenceCalculator:
         historical_modifier: float = 0,
         historical_explanation: str = "",
         htf_aligned: Optional[bool] = None,
+        coverage: float = 1.0,
     ) -> ConfidenceBreakdown:
         """
         Calculate confidence with full breakdown.
@@ -188,19 +193,30 @@ class ConfidenceCalculator:
             bd.evidence_quality_modifier = 0
             bd.evidence_quality_explanation = "Mixed evidence quality: no adjustment"
         
+        # ── Stage 8: STATE COVERAGE ──────────────────────────────────────────
+        coverage = max(0.0, min(1.0, coverage))
+        bd.coverage_modifier = -20.0 * (1.0 - coverage)
+        bd.coverage_explanation = (
+            f"State coverage {coverage:.0%}; incomplete inputs reduce confidence "
+            f"({bd.coverage_modifier:.1f})"
+        )
+
         # ── FINAL CALCULATION ─────────────────────────────────────────────────
         bd.bonus_total = sum(x for x in [
             bd.regime_modifier, bd.gex_modifier, bd.historical_modifier,
             bd.velocity_modifier, bd.mtf_modifier, bd.evidence_quality_modifier,
+            bd.coverage_modifier,
         ] if x > 0)
         
         bd.penalty_total = sum(x for x in [
             bd.regime_modifier, bd.gex_modifier, bd.historical_modifier,
             bd.velocity_modifier, bd.mtf_modifier, bd.evidence_quality_modifier,
+            bd.coverage_modifier,
         ] if x < 0)
         
         bd.final = max(0, min(99, bd.base + bd.regime_modifier + bd.gex_modifier +
                               bd.historical_modifier + bd.velocity_modifier +
-                              bd.mtf_modifier + bd.evidence_quality_modifier))
+                              bd.mtf_modifier + bd.evidence_quality_modifier +
+                              bd.coverage_modifier))
         
         return bd

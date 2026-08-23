@@ -1,115 +1,135 @@
-# SignalsBrain — God Mode
+# SignalsBrain
 
-**47-dimension market intelligence for Indian F&O. Connect any AI model.**
+SignalsBrain is an auditable market-state reasoning service for Indian F&O analysis. It ingests market data, derives a declared 47-dimension state model from the inputs that are actually available, produces deterministic evidence chains and safety vetoes, records signal outcomes in SQLite, and exposes the same application runtime through REST, Python, GodMode composition, and MCP.
 
-A reasoning intelligence layer that processes what no human expert can: 47 market dimensions simultaneously, with velocity tracking, pattern memory across thousands of historical setups, and multi-model AI consensus — all in under 5 milliseconds.
+SignalsBrain does **not** connect to a broker or place orders. External-model consensus is advisory and cannot override deterministic safety vetoes.
 
----
+## Capabilities
 
-## What It Does
+- **State ingestion:** derives price, trend, momentum, options, flow, volatility, and session dimensions from supplied data.
+- **State quality:** reports populated versus declared dimensions, category coverage, freshness, and missing dimensions. Missing inputs reduce composite influence and decision confidence.
+- **Reasoning:** emits BUY, SELL, or NO_TRADE with evidence, confidence breakdown, risk scenarios, timing, and hard/soft safety vetoes.
+- **Pattern memory:** stores signals and explicit lifecycle outcomes in SQLite and calculates pattern/regime statistics from completed records.
+- **Durable audit data:** stores schema metadata, state snapshots, decisions, idempotency responses, and audit events through additive migrations.
+- **Learning:** records outcome-driven learning history and context-specific factor adjustments using atomic local writes.
+- **Model integration:** publishes tool schemas and optional multi-model consensus. External API latency depends on the configured provider and network.
 
-| Layer | Purpose | Speed |
-|-------|---------|-------|
-| **MarketState** | 47-dimension real-time state with velocity + acceleration | 1ms |
-| **PatternMemory** | "What happened the last 50 times this exact setup occurred?" | 2ms |
-| **ReasoningEngine** | Full evidence chain: WHY a signal fires/doesn't | 1ms |
-| **ModelConnector** | Universal API for GPT, Claude, Gemini, Grok, MCP | instant |
-| **GodMode** | Multi-model consensus + self-improvement loop | 4ms total |
+## Install and run
 
-## Quick Start
+Python 3.11 or newer is required.
 
 ```bash
-# Clone
-git clone https://github.com/consecrating/SignalsBrain.git
-cd SignalsBrain
-
-# Install (Python 3.11+)
 pip install -e .
-
-# Run the API server
+export SIGNALSBRAIN_ENV=development  # explicit local-only frictionless mode
 signalsbrain
-# or: uvicorn api.main:app --port 8400
+# Equivalent local bind: uvicorn api.main:app --host 127.0.0.1 --port 8400
+```
 
-# Health check
+The stable CLI entry point starts one worker on loopback port `8400` by default. Override the port with `PORT` or the bind address with `SIGNALSBRAIN_HOST`. Omitting `SIGNALSBRAIN_ENV` is production mode and startup fails closed until production credentials are configured.
+
+```bash
 curl http://localhost:8400/brain/health
 ```
 
-## Connect an AI Model
+## Security modes
 
-### OpenAI / GPT-4
-```python
-import openai
+SignalsBrain defaults to fail-closed production mode. Frictionless behavior is available only when local development or test mode is selected explicitly:
 
-# Get the tool schemas
-tools = requests.get("http://localhost:8400/brain/schemas/openai").json()["tools"]
-
-# Use in your chat completions
-response = openai.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "Should I buy NIFTY PE now?"}],
-    tools=tools,
-)
+```bash
+export SIGNALSBRAIN_ENV=development
+signalsbrain
 ```
 
-### Claude (Anthropic)
-```python
-tools = requests.get("http://localhost:8400/brain/schemas/anthropic").json()["tools"]
-# Use as tool_definitions in Anthropic API
+Production requires two distinct non-default credentials: the general API key and a dedicated outcome-writer key. General routes accept `X-API-Key` or `Authorization: Bearer`. The v1 and v2 outcome routes accept only `X-Outcome-API-Key` in production. Query-string credentials are disabled in production, and CORS origins must be explicitly listed.
+
+```bash
+export SIGNALSBRAIN_ENV=production
+export SIGNALSBRAIN_API_KEY='replace-with-a-long-random-general-secret'
+export SIGNALSBRAIN_OUTCOME_API_KEY='replace-with-a-different-outcome-writer-secret'
+export SIGNALSBRAIN_CORS_ORIGINS='https://app.example.com,https://ops.example.com'
+export SIGNALSBRAIN_MAX_BODY_BYTES=1048576          # optional; defaults to 1 MiB
+export SIGNALSBRAIN_DECISION_MAX_AGE_SECONDS=300    # optional; absolute decision freshness
+export SIGNALSBRAIN_IDEMPOTENCY_TTL_SECONDS=86400   # optional; 60 seconds to 30 days
+export SIGNALSBRAIN_HOST=0.0.0.0                    # explicit external CLI bind
+signalsbrain
 ```
 
-### Claude Desktop / Kiro (MCP)
-Add to your MCP config:
-```json
-{
-  "mcpServers": {
-    "signalsbrain": {
-      "command": "python",
-      "args": ["-m", "brain.connectors.mcp_server"],
-      "cwd": "/path/to/SignalsBrain"
-    }
-  }
-}
+Example authenticated analysis and outcome calls:
+
+```bash
+curl -X POST http://localhost:8400/brain/v2/analyze \
+  -H "X-API-Key: $SIGNALSBRAIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"instrument":"NIFTY"}'
+
+curl -X POST http://localhost:8400/brain/v2/outcome \
+  -H "X-Outcome-API-Key: $SIGNALSBRAIN_OUTCOME_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"signal_id":123,"outcome":"WIN_T1"}'
 ```
 
-### Gemini
-```python
-tools = requests.get("http://localhost:8400/brain/schemas/gemini").json()["tools"]
+## REST API
+
+All original v1 routes, request defaults, and response fields remain available:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/brain/ingest` | Ingest market data |
+| `POST` | `/brain/analyze` | Produce a reasoning chain |
+| `POST` | `/brain/signal` | Generate and persist an actionable signal |
+| `POST` | `/brain/ask` | Build context for a natural-language answer |
+| `GET` | `/brain/state/{instrument}` | Read current state |
+| `POST` | `/brain/history` | Query pattern memory |
+| `POST` | `/brain/outcome` | Close a signal and invoke learning |
+| `GET` | `/brain/schemas/{type}` | Read model tool schemas |
+| `GET` | `/brain/health` | Stable v1 health response |
+| `GET` | `/brain/dashboard` | State, active-trade, and daily summary |
+
+V1 keeps the same field names, defaults, response shapes, and permissive unknown-field behavior, while defensively rejecting non-finite, over-deep, oversized, or unequal OHLCV inputs. The additive v2 API provides strict typed validation and structured errors:
+
+| Method | Endpoint | Additional behavior |
+|---|---|---|
+| `GET` | `/brain/v2/health` | Runtime, schema, and learning metadata |
+| `POST` | `/brain/v2/ingest` | Finite, bounded, equal-length OHLCV validation; state quality |
+| `POST` | `/brain/v2/analyze` | Analysis plus state quality |
+| `POST` | `/brain/v2/signal` | Optional `Idempotency-Key` header or `idempotency_key` body field |
+| `POST` | `/brain/v2/outcome` | Explicit missing/already-closed lifecycle errors |
+| `GET` | `/brain/v2/state/{instrument}` | State plus quality metadata |
+
+A repeated v2 signal request with the same unexpired idempotency key and payload returns the original response without inserting another signal. Reusing the key for a different payload returns `IDEMPOTENCY_CONFLICT`. Keys expire under the bounded TTL policy and are pruned opportunistically; signal/no-trade persistence commits its decision and audit record in the same transaction as the retry response.
+
+## MCP
+
+The four existing MCP tool names are unchanged:
+
+- `signalsbrain_analyze`
+- `signalsbrain_signal`
+- `signalsbrain_ask`
+- `signalsbrain_history`
+
+Install the optional MCP extra and run the local stdio server:
+
+```bash
+pip install -e '.[mcp]'
+python -m brain.connectors.mcp_server
 ```
 
-## API Endpoints
+The MCP server invokes the same `BrainRuntime`, validates every tool call with the shared strict models, returns stable generic errors, and refreshes valid persisted snapshots before decision calls. REST and MCP both restore snapshots for read continuity, but analysis, signals, and question reasoning reject stale or future state using the absolute configured decision-freshness threshold.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/brain/ingest` | Feed market data into the brain |
-| `POST` | `/brain/analyze` | Full 47-dim analysis + evidence chain |
-| `POST` | `/brain/signal` | Generate BUY/SELL/NO_TRADE with reasoning |
-| `POST` | `/brain/ask` | Natural language query |
-| `GET` | `/brain/state/{inst}` | Current state vector |
-| `POST` | `/brain/history` | Pattern memory lookup |
-| `POST` | `/brain/outcome` | Record trade result (for learning) |
-| `GET` | `/brain/schemas/{type}` | Get tool schemas (openai/anthropic/mcp/gemini) |
-| `GET` | `/brain/health` | Health check |
-| `GET` | `/brain/dashboard` | All states + active trades |
+## State model
 
-## The 47 Dimensions
+The registry declares 47 dimensions across seven categories: price structure, trend, momentum, options microstructure, volume/flow, volatility, and time context. A given snapshot may populate only a subset, depending on supplied data. `/brain/v2/ingest` and `/brain/v2/state/{instrument}` expose the exact coverage and missing-dimension list instead of implying that all dimensions are always present.
 
-**Price Structure (8):** LTP, day change, range position, VWAP deviation, EMA distance, ORB status, S/R proximity, 20d range
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the original layer overview.
 
-**Trend (7):** EMA stack, SuperTrend, ADX value/regime, DI differential, higher-TF, trend acceleration
+## Verification
 
-**Momentum (6):** RSI, RSI divergence, MACD histogram/direction, RoC, Stochastic
+Focused v2 checks cover repeatable migration and row preservation, signal idempotency and lifecycle closure, explicit outcome/recency statistics, state quality and derivative propagation, model parsing/weighting, and v2 request validation.
 
-**Options Microstructure (12):** PCR, PCR velocity, ATM IV, IV percentile, IV skew, GEX regime, GEX net, GEX flip distance, call/put wall distance, max pain, OI buildup
-
-**Volume & Flow (6):** Volume ratio/trend, VWAP position, delivery %, FII/DII flow
-
-**Volatility (4):** VIX, VIX change, BB width (squeeze), ATR %
-
-**Time & Context (4):** Session minutes, DTE, day of week, session phase
-
-## Architecture
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full 5-layer design.
+```bash
+python -m compileall -q api brain
+python -m pytest -q tests/test_v2_runtime.py
+```
 
 ## License
 

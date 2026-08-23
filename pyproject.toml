@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "signalsbrain"
-version = "1.0.0"
-description = "God Mode intelligence layer for Indian F&O markets. 47-dimension state engine + pattern memory + reasoning chains + universal AI model connector."
+version = "2.0.0"
+description = "Auditable v2 intelligence runtime for Indian F&O markets with state quality, durable lifecycle memory, deterministic reasoning, and backward-compatible APIs."
 readme = "README.md"
 license = {text = "Proprietary"}
 requires-python = ">=3.11"
@@ -37,3 +37,7 @@ full = [
 
 [project.scripts]
 signalsbrain = "api.main:run"
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["api", "brain"]

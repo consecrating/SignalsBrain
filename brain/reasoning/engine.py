@@ -75,6 +75,8 @@ class ReasoningEngine:
             instrument=state.instrument,
             timestamp=time.time(),
         )
+        if state.quality.declared_count == 0:
+            state.compute_quality()
         
         # ── Step 1: Collect all evidence ──────────────────────────────────────
         all_evidence = self.evidence_builder.build(state)
@@ -109,6 +111,7 @@ class ReasoningEngine:
             historical_modifier=hist_ctx.confidence_modifier,
             historical_explanation=hist_ctx.confidence_reason,
             htf_aligned=htf_aligned,
+            coverage=state.quality.coverage,
         )
         confidence = conf_breakdown.final
         

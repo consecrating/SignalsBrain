@@ -14,4 +14,7 @@ RUN mkdir -p data
 
 EXPOSE 8400
 
+# Containers are deployment environments; startup remains fail-closed until
+# both credentials are injected by the operator.
+ENV SIGNALSBRAIN_ENV=production
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8400"]
