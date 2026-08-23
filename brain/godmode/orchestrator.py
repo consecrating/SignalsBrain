@@ -37,6 +37,7 @@ from ..memory.matcher import PatternMatcher, HistoricalContext
 from ..memory.outcome_tracker import OutcomeTracker
 from ..reasoning.engine import ReasoningEngine
 from ..reasoning.evidence_chain import EvidenceChain
+from ..runtime import BrainRuntime
 from .multi_model import MultiModelEngine, ConsensusResult
 from .self_improve import SelfImproveEngine
 
@@ -136,17 +137,17 @@ class GodModeOrchestrator:
         self,
         pattern_db: Optional[PatternDB] = None,
         ai_config: Optional[dict] = None,
+        runtime: Optional[BrainRuntime] = None,
     ):
-        self.state_builder = StateBuilder()
-        self.pattern_db = pattern_db
-        self.reasoning_engine = ReasoningEngine(pattern_db=pattern_db)
-        self.pattern_matcher = PatternMatcher(pattern_db) if pattern_db else None
-        self.outcome_tracker = OutcomeTracker(pattern_db) if pattern_db else None
+        self.runtime = runtime or BrainRuntime(pattern_db=pattern_db)
+        self.state_builder = self.runtime.state_builder
+        self.pattern_db = self.runtime.pattern_db
+        self.reasoning_engine = self.runtime.reasoning_engine
+        self.pattern_matcher = PatternMatcher(self.pattern_db)
+        self.outcome_tracker = self.runtime.outcome_tracker
         self.multi_model = MultiModelEngine(ai_config or {})
-        self.self_improve = SelfImproveEngine()
-        
-        # State cache
-        self._states: dict[str, MarketState] = {}
+        self.self_improve = self.runtime.self_improve
+        self._states = self.runtime.state_cache
     
     def execute(
         self,
@@ -178,7 +179,7 @@ class GodModeOrchestrator:
         instrument = instrument.upper()
         
         # ── Step 1: Build MarketState ─────────────────────────────────────────
-        state = self.state_builder.build(
+        state, _ = self.runtime.ingest_state(
             instrument=instrument,
             candles=candles,
             gex_data=gex_data,
@@ -186,7 +187,6 @@ class GodModeOrchestrator:
             vix=vix,
             htf_candles=htf_candles,
         )
-        self._states[instrument] = state
         
         # ── Step 2: Regime shift detection ────────────────────────────────────
         tracker = self.state_builder._tracker(instrument)
@@ -194,7 +194,7 @@ class GodModeOrchestrator:
         divergences = tracker.detect_divergence()
         
         # ── Step 3: Reasoning Engine ──────────────────────────────────────────
-        chain = self.reasoning_engine.reason(
+        chain = self.runtime.reason_state(
             state,
             session_signals=session_signals,
             session_stops=session_stops,
@@ -296,7 +296,7 @@ class GodModeOrchestrator:
                 brain_prompt=brain_prompt,
                 brain_direction=output.direction,
                 brain_confidence=output.final_confidence,
-                regime=output.brain_chain.to_dict().get("timing", {}).get("note", ""),
+                regime=(self.get_state(output.instrument).regime if self.get_state(output.instrument) else "Unknown"),
             )
             output.consensus = consensus
             
@@ -332,29 +332,19 @@ class GodModeOrchestrator:
         """
         Record a trade outcome — triggers self-improvement loop.
         """
-        # Record in pattern DB
-        if self.pattern_db:
-            self.pattern_db.record_outcome(
-                signal_id=signal_id,
-                outcome=outcome,
-                exit_spot=exit_spot,
-                exit_premium=exit_premium,
-                move_atr=0,
-                duration_min=0,
-                pnl_pct=pnl_pct,
-            )
-        
-        # Self-improvement analysis
-        if evidence_factors:
-            self.self_improve.analyze_outcome(
-                regime=regime,
-                gex_regime=gex_regime,
-                direction=direction,
-                confidence=confidence,
-                evidence_factors=evidence_factors,
-                outcome=outcome,
-                vetoes_applied=vetoes or [],
-            )
+        self.runtime.record_outcome(
+            signal_id=signal_id,
+            outcome=outcome,
+            exit_spot=exit_spot,
+            exit_premium=exit_premium,
+            pnl_pct=pnl_pct,
+            evidence_factors=evidence_factors,
+            regime=regime,
+            gex_regime=gex_regime,
+            direction=direction,
+            confidence=confidence,
+            vetoes=vetoes,
+        )
     
     def _build_final_verdict(self, output: GodModeOutput, state: MarketState, divergences: list) -> str:
         """Build the one-sentence God Mode verdict."""

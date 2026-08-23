@@ -27,6 +27,8 @@ The consensus is NOT a simple vote. It's a weighted synthesis that accounts for:
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -126,6 +128,26 @@ MODEL_WEIGHTS = {
         "risk_detection": 0.7,
     },
 }
+
+
+MODEL_ALIASES = {
+    "openai": "gpt-4o",
+    "gpt": "gpt-4o",
+    "anthropic": "claude",
+}
+
+
+def canonical_model_name(model_name: str, model_id: str = "") -> str:
+    """Normalize configured provider keys to calibrated weight profile names."""
+    lowered = model_name.lower()
+    if lowered in MODEL_ALIASES:
+        return MODEL_ALIASES[lowered]
+    model_lower = model_id.lower()
+    if "claude" in model_lower:
+        return "claude"
+    if "gpt-4o" in model_lower:
+        return "gpt-4o"
+    return lowered
 
 
 class MultiModelEngine:
@@ -281,7 +303,9 @@ class MultiModelEngine:
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             
-            return self._parse_model_response(model_name, model_id, content, latency)
+            return self._parse_model_response(
+                canonical_model_name(model_name, model_id), model_id, content, latency
+            )
             
         except Exception as e:
             return ModelResponse(
@@ -357,28 +381,29 @@ class MultiModelEngine:
     def _parse_model_response(self, model_name: str, model_id: str,
                               content: str, latency: float) -> ModelResponse:
         """Parse the model's text response into structured ModelResponse."""
-        content_upper = content.upper()
-        
-        # Extract direction
+        # Parse the explicit contract fields only. Direction words in prose or
+        # risk sections must never be interpreted as the recommendation.
         direction = "UNCERTAIN"
-        if "BUY" in content_upper and "SELL" not in content_upper:
-            direction = "BUY"
-        elif "SELL" in content_upper and "BUY" not in content_upper:
-            direction = "SELL"
-        elif "NO TRADE" in content_upper or "NO_TRADE" in content_upper or "AVOID" in content_upper or "WAIT" in content_upper:
-            direction = "NO_TRADE"
-        elif "SELL" in content_upper and content_upper.index("SELL") < content_upper.index("BUY") if "BUY" in content_upper else True:
-            direction = "SELL"
-        elif "BUY" in content_upper:
-            direction = "BUY"
-        
-        # Extract confidence (look for patterns like "75%", "confidence: 80")
-        confidence = 50.0  # Default
-        import re
-        conf_match = re.search(r'(\d{1,2})[%\s]*confidence|confidence[:\s]*(\d{1,2})', content, re.IGNORECASE)
+        direction_match = re.search(
+            r"(?im)^\s*DIRECTION\s*:\s*(BUY|SELL|NO(?:_|\s)?TRADE|UNCERTAIN)\b",
+            content,
+        )
+        if direction_match:
+            direction = direction_match.group(1).upper().replace(" ", "_")
+        else:
+            leading = re.match(r"\s*(BUY|SELL|NO(?:_|\s)?TRADE|UNCERTAIN)\b", content, re.IGNORECASE)
+            if leading:
+                direction = leading.group(1).upper().replace(" ", "_")
+
+        confidence = 50.0
+        conf_match = re.search(
+            r"(?im)^\s*CONFIDENCE\s*:\s*(\d{1,3}(?:\.\d+)?)\s*%?\b",
+            content,
+        )
         if conf_match:
-            val = conf_match.group(1) or conf_match.group(2)
-            confidence = float(val)
+            parsed = float(conf_match.group(1))
+            if math.isfinite(parsed):
+                confidence = max(0.0, min(100.0, parsed))
         
         # Extract risks
         risks = []
@@ -415,15 +440,36 @@ class MultiModelEngine:
                 responses=responses, total_latency_ms=total_latency,
             )
         
-        # Calculate weighted votes
+        decisive = [response for response in valid if response.direction != "UNCERTAIN"]
+        if not decisive:
+            risks = list({risk for response in valid for risk in response.risks_identified})[:8]
+            return ConsensusResult(
+                direction=brain_direction,
+                consensus_strength="SOLO",
+                weighted_confidence=brain_confidence,
+                confidence_range=(brain_confidence, brain_confidence),
+                models_queried=len(valid),
+                models_agree=0,
+                models_disagree=0,
+                agreement_ratio=0,
+                consensus_reasoning="External models were uncertain. Using brain analysis only.",
+                dissent_note="All external models abstained as UNCERTAIN.",
+                unique_risks=risks,
+                responses=responses,
+                total_latency_ms=total_latency,
+            )
+
+        # Calculate weighted votes. UNCERTAIN responses abstain: they neither
+        # become NO_TRADE votes nor count as disagreement.
         regime_key = regime.lower() if regime else "unknown"
         direction_votes: dict[str, float] = {"BUY": 0, "SELL": 0, "NO_TRADE": 0}
         confidence_values: list[float] = []
+        weighted_confidence_inputs: list[tuple[float, float]] = []
         all_risks: list[str] = []
         
-        for r in valid:
-            # Get model weight profile
-            profile = MODEL_WEIGHTS.get(r.model_name, {"base_weight": 0.8, "trending_bonus": 0, "choppy_bonus": 0})
+        for r in decisive:
+            profile_name = canonical_model_name(r.model_name, r.model_id)
+            profile = MODEL_WEIGHTS.get(profile_name, {"base_weight": 0.8, "trending_bonus": 0, "choppy_bonus": 0})
             weight = profile["base_weight"]
             if regime_key == "trending":
                 weight += profile.get("trending_bonus", 0)
@@ -434,6 +480,7 @@ class MultiModelEngine:
             vote_dir = r.direction if r.direction in direction_votes else "NO_TRADE"
             direction_votes[vote_dir] += weight
             confidence_values.append(r.confidence)
+            weighted_confidence_inputs.append((r.confidence, weight))
             all_risks.extend(r.risks_identified)
         
         # Include brain's own vote (weighted higher — it has the data)
@@ -441,6 +488,7 @@ class MultiModelEngine:
         brain_vote = brain_direction if brain_direction in direction_votes else "NO_TRADE"
         direction_votes[brain_vote] += brain_weight
         confidence_values.append(brain_confidence)
+        weighted_confidence_inputs.append((brain_confidence, brain_weight))
         
         # Determine consensus direction (highest weighted vote)
         consensus_dir = max(direction_votes, key=direction_votes.get)
@@ -448,8 +496,8 @@ class MultiModelEngine:
         winner_weight = direction_votes[consensus_dir]
         
         # Agreement
-        models_agree = sum(1 for r in valid if r.direction == consensus_dir)
-        models_disagree = len(valid) - models_agree
+        models_agree = sum(1 for r in decisive if r.direction == consensus_dir)
+        models_disagree = len(decisive) - models_agree
         agreement_ratio = winner_weight / total_weight if total_weight > 0 else 0
         
         # Consensus strength
@@ -464,8 +512,12 @@ class MultiModelEngine:
         else:
             strength = "SPLIT"
         
-        # Weighted confidence
-        weighted_conf = sum(confidence_values) / len(confidence_values) if confidence_values else brain_confidence
+        # Confidence uses the same regime-adjusted weights as direction voting.
+        confidence_weight_total = sum(weight for _, weight in weighted_confidence_inputs)
+        weighted_conf = (
+            sum(value * weight for value, weight in weighted_confidence_inputs) / confidence_weight_total
+            if confidence_weight_total > 0 else brain_confidence
+        )
         # Adjust by agreement: unanimous boosts, split penalizes
         if strength == "UNANIMOUS":
             weighted_conf = min(99, weighted_conf + 5)
@@ -473,7 +525,7 @@ class MultiModelEngine:
             weighted_conf = max(0, weighted_conf - 10)
         
         # Dissent note
-        dissenters = [r for r in valid if r.direction != consensus_dir]
+        dissenters = [r for r in decisive if r.direction != consensus_dir]
         dissent = ""
         if dissenters:
             dissent_reasons = [f"{r.model_name}: {r.direction} ({r.reasoning[:100]})" for r in dissenters[:2]]
@@ -483,9 +535,9 @@ class MultiModelEngine:
         unique_risks = list(set(all_risks))[:8]
         
         # Consensus reasoning
-        agreers = [r for r in valid if r.direction == consensus_dir]
+        agreers = [r for r in decisive if r.direction == consensus_dir]
         reasoning_parts = [r.reasoning[:150] for r in agreers[:2]]
-        consensus_reasoning = f"{strength} consensus ({models_agree}/{len(valid)} models agree): {consensus_dir}. " + " ".join(reasoning_parts)[:300]
+        consensus_reasoning = f"{strength} consensus ({models_agree}/{len(decisive)} decisive models agree): {consensus_dir}. " + " ".join(reasoning_parts)[:300]
         
         return ConsensusResult(
             direction=consensus_dir,

@@ -22,6 +22,8 @@ The brain exposes 6 core functions:
 
 from __future__ import annotations
 
+from .validation import MCP_REQUEST_MODELS
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OPENAI FUNCTION CALLING SCHEMA
@@ -266,54 +268,20 @@ ANTHROPIC_TOOLS = [
 # MCP (Model Context Protocol) TOOL DEFINITIONS — For Claude Desktop/Kiro
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_MCP_DESCRIPTIONS = {
+    "signalsbrain_analyze": "Full market analysis from SignalsBrain: state, evidence chain, confidence, risk, and historical pattern match.",
+    "signalsbrain_signal": "Generate a BUY/SELL/NO_TRADE signal with reasoning and risk assessment.",
+    "signalsbrain_ask": "Ask SignalsBrain a bounded natural-language question about Indian F&O markets.",
+    "signalsbrain_history": "Query historical pattern memory, win rates, and regime performance.",
+}
+
 MCP_TOOLS = [
     {
-        "name": "signalsbrain_analyze",
-        "description": "Full market analysis from SignalsBrain: 47-dimension state, evidence chain, GEX regime, confidence breakdown, risk scenarios, historical pattern match. Use for any F&O trading question about Indian markets.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "instrument": {"type": "string", "description": "Symbol: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, or any F&O stock"},
-            },
-            "required": ["instrument"],
-        },
-    },
-    {
-        "name": "signalsbrain_signal",
-        "description": "Generate actionable BUY/SELL/NO_TRADE signal with full reasoning, option trade plan, and risk assessment.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "instrument": {"type": "string"},
-                "confidence_threshold": {"type": "number"},
-            },
-            "required": ["instrument"],
-        },
-    },
-    {
-        "name": "signalsbrain_ask",
-        "description": "Ask SignalsBrain any natural language question about Indian F&O markets.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string"},
-                "instrument": {"type": "string"},
-            },
-            "required": ["question"],
-        },
-    },
-    {
-        "name": "signalsbrain_history",
-        "description": "Query historical pattern memory: win rates, similar setups, regime performance.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "instrument": {"type": "string"},
-                "direction": {"type": "string", "enum": ["BUY", "SELL"]},
-            },
-            "required": ["instrument", "direction"],
-        },
-    },
+        "name": name,
+        "description": _MCP_DESCRIPTIONS[name],
+        "inputSchema": model.model_json_schema(),
+    }
+    for name, model in MCP_REQUEST_MODELS.items()
 ]
 
 

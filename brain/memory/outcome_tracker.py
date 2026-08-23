@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .pattern_db import PatternDB
 
@@ -60,7 +60,8 @@ class ActiveTrade:
         self.t1_spot = self.entry_spot + mul * 1.0 * self.atr
         self.t2_spot = self.entry_spot + mul * 2.0 * self.atr
         self.t3_spot = self.entry_spot + mul * 3.2 * self.atr
-        self.highest_premium = self.entry_premium
+        if self.highest_premium <= 0:
+            self.highest_premium = self.entry_premium
 
 
 class OutcomeTracker:
@@ -69,13 +70,20 @@ class OutcomeTracker:
     Call `check()` on every market scan with the current price.
     """
     
-    def __init__(self, db: PatternDB):
+    def __init__(self, db: PatternDB, record_callback: Optional[Callable[..., object]] = None):
         self.db = db
+        self.record_callback = record_callback
         self.active_trades: dict[int, ActiveTrade] = {}  # signal_id → ActiveTrade
+
+    def _record_outcome(self, **kwargs):
+        recorder = self.record_callback or self.db.record_outcome
+        return recorder(**kwargs)
     
     def start_tracking(self, signal_id: int, instrument: str, direction: str,
                        entry_spot: float, entry_premium: float, strike: float,
-                       opt_type: str, atr: float):
+                       opt_type: str, atr: float, entry_time: Optional[float] = None,
+                       t1_hit: bool = False, t2_hit: bool = False,
+                       highest_premium: Optional[float] = None):
         """Begin tracking a new trade for outcome."""
         trade = ActiveTrade(
             signal_id=signal_id,
@@ -86,8 +94,18 @@ class OutcomeTracker:
             strike=strike,
             opt_type=opt_type,
             atr=atr,
+            entry_time=entry_time if entry_time is not None else time.time(),
+            t1_hit=t1_hit,
+            t2_hit=t2_hit,
+            highest_premium=entry_premium if highest_premium is None else highest_premium,
         )
         self.active_trades[signal_id] = trade
+        self.db.upsert_active_trade_progress(
+            signal_id,
+            t1_hit=trade.t1_hit,
+            t2_hit=trade.t2_hit,
+            highest_premium=trade.highest_premium,
+        )
     
     def check(self, instrument: str, current_spot: float, current_premium: Optional[float] = None) -> list[dict]:
         """
@@ -101,11 +119,25 @@ class OutcomeTracker:
             if trade.instrument != instrument:
                 continue
             
+            durable = self.db.get_active_trade_progress(sid)
+            if durable:
+                trade.t1_hit = trade.t1_hit or durable["t1_hit"]
+                trade.t2_hit = trade.t2_hit or durable["t2_hit"]
+                trade.highest_premium = max(trade.highest_premium, durable["highest_premium"])
+            before_progress = (trade.t1_hit, trade.t2_hit, trade.highest_premium)
             # Update high-water mark
             if current_premium and current_premium > trade.highest_premium:
                 trade.highest_premium = current_premium
             
             outcome = self._check_trade(trade, current_spot)
+            after_progress = (trade.t1_hit, trade.t2_hit, trade.highest_premium)
+            if not outcome and after_progress != before_progress:
+                self.db.upsert_active_trade_progress(
+                    sid,
+                    t1_hit=trade.t1_hit,
+                    t2_hit=trade.t2_hit,
+                    highest_premium=trade.highest_premium,
+                )
             
             if outcome:
                 # Calculate P&L
@@ -123,7 +155,7 @@ class OutcomeTracker:
                     pnl_pct = move_atr * 80  # Rough: 1 ATR move ≈ 80% premium gain for ATM
                 
                 # Record in pattern memory
-                self.db.record_outcome(
+                self._record_outcome(
                     signal_id=sid,
                     outcome=outcome,
                     exit_spot=current_spot,
@@ -162,7 +194,7 @@ class OutcomeTracker:
             # Hard time exit: 4 hours max for any trade
             if elapsed_min > 240:
                 duration = elapsed_min
-                self.db.record_outcome(
+                self._record_outcome(
                     signal_id=sid,
                     outcome="TIME_EXIT",
                     exit_spot=trade.entry_spot,  # Approximate (we don't have current price here)

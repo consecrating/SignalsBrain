@@ -92,7 +92,18 @@ class StateBuilder:
         # ── Time Context ──────────────────────────────────────────────────────
         self._build_time_context(state)
         
-        # ── Compute composites ────────────────────────────────────────────────
+        # ── Propagate derivatives into the state itself ──────────────────────
+        # Individual builders register the dimensions they derive. Fill any
+        # omissions once, then copy the tracker derivatives onto DimensionValue.
+        for name, value in state.dimensions.items():
+            history = tracker.histories.get(name)
+            if history is None or not history.timestamps or history.timestamps[-1] != ts:
+                tracker.update(name, value.normalized, ts)
+            value.velocity = tracker.get_velocity(name)
+            value.acceleration = tracker.get_acceleration(name)
+
+        # ── Compute quality and composites ───────────────────────────────────
+        state.compute_quality()
         state.compute_composites()
         state.scan_number = tracker.scan_count
         tracker.scan_count += 1

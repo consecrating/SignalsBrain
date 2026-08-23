@@ -35,6 +35,30 @@ class DimensionValue:
 
 
 @dataclass
+class StateQuality:
+    """Completeness and freshness metadata for one state snapshot."""
+    coverage: float = 0.0
+    freshness_seconds: float = 0.0
+    missing_dimensions: list[str] = field(default_factory=list)
+    populated_count: int = 0
+    declared_count: int = 0
+    category_coverage: dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self, freshness_seconds: Optional[float] = None) -> dict:
+        freshness = self.freshness_seconds if freshness_seconds is None else freshness_seconds
+        return {
+            "coverage": round(self.coverage, 4),
+            "freshness_seconds": round(max(0.0, freshness), 3),
+            "missing_dimensions": list(self.missing_dimensions),
+            "populated_count": self.populated_count,
+            "declared_count": self.declared_count,
+            "category_coverage": {
+                name: round(value, 4) for name, value in self.category_coverage.items()
+            },
+        }
+
+
+@dataclass
 class MarketState:
     """
     Complete 47-dimension market state for one instrument at one instant.
@@ -60,6 +84,7 @@ class MarketState:
     regime: str = "unknown"  # Trending/Developing/Choppy
     gex_regime: str = "unknown"  # Positive/Negative/Unknown
     dominant_category: str = ""  # Which category is driving the signal most
+    quality: StateQuality = field(default_factory=StateQuality)
     
     # ──────────────────────────────────────────────────────────────────────────
     # SETTERS
@@ -77,6 +102,32 @@ class MarketState:
     # COMPUTED PROPERTIES
     # ──────────────────────────────────────────────────────────────────────────
     
+    def compute_quality(self):
+        """Compute declared/populated coverage without treating missing data as neutral evidence."""
+        declared = set(DIMENSIONS)
+        populated = set(self.dimensions) & declared
+        category_coverage: dict[str, float] = {}
+        for category in DimensionCategory:
+            category_dims = {
+                name for name, definition in DIMENSIONS.items()
+                if definition.category == category
+            }
+            category_coverage[category.value] = (
+                len(category_dims & populated) / len(category_dims) if category_dims else 1.0
+            )
+        self.quality = StateQuality(
+            coverage=len(populated) / len(declared) if declared else 1.0,
+            freshness_seconds=max(0.0, self.age_seconds),
+            missing_dimensions=sorted(declared - populated),
+            populated_count=len(populated),
+            declared_count=len(declared),
+            category_coverage=category_coverage,
+        )
+
+    def quality_dict(self) -> dict:
+        """Return quality with freshness recalculated at read time."""
+        return self.quality.to_dict(freshness_seconds=self.age_seconds)
+
     def compute_composites(self):
         """Calculate net bias, agreement, regime from all dimensions."""
         if not self.dimensions:
@@ -85,7 +136,11 @@ class MarketState:
         # Net directional bias: weighted sum of all normalized dimensions
         # Each dimension contributes: normalized_value × dimension_weight × category_weight
         category_scores: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
-        category_counts: dict[str, int] = {cat.value: 0 for cat in DimensionCategory}
+        category_populated_weight: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
+        category_declared_weight: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
+        for definition in DIMENSIONS.values():
+            if definition.weight > 0:
+                category_declared_weight[definition.category.value] += definition.weight
         
         for dim_name, dim_val in self.dimensions.items():
             dim_def = DIMENSIONS.get(dim_name)
@@ -95,15 +150,17 @@ class MarketState:
             # Dimension contributes its normalized value × its weight within its category
             cat = dim_def.category.value
             category_scores[cat] += dim_val.normalized * dim_def.weight
-            category_counts[cat] += dim_def.weight
+            category_populated_weight[cat] += dim_def.weight
         
         # Normalize each category to [-1, +1], then apply category weights
         net = 0.0
         for cat_enum in DimensionCategory:
             cat = cat_enum.value
-            total_weight = category_counts.get(cat, 0)
-            if total_weight > 0:
-                cat_bias = category_scores[cat] / total_weight  # [-1, +1]
+            declared_weight = category_declared_weight.get(cat, 0)
+            if declared_weight > 0:
+                # Missing dimensions contribute no evidence rather than allowing a
+                # partial category to receive its full configured influence.
+                cat_bias = category_scores[cat] / declared_weight
                 net += cat_bias * CATEGORY_WEIGHTS.get(cat_enum, 0)
         
         # net is now in [-100, +100]
@@ -130,9 +187,9 @@ class MarketState:
         max_cat_abs = 0
         for cat_enum in DimensionCategory:
             cat = cat_enum.value
-            total_weight = category_counts.get(cat, 0)
-            if total_weight > 0:
-                cat_abs = abs(category_scores[cat] / total_weight)
+            declared_weight = category_declared_weight.get(cat, 0)
+            if declared_weight > 0 and category_populated_weight.get(cat, 0) > 0:
+                cat_abs = abs(category_scores[cat] / declared_weight)
                 if cat_abs > max_cat_abs:
                     max_cat_abs = cat_abs
                     max_cat = cat
@@ -256,11 +313,47 @@ class MarketState:
         
         return float(dot / (norm1 * norm2))
     
+    @classmethod
+    def from_dict(cls, data: dict, quality: Optional[dict] = None) -> "MarketState":
+        """Rehydrate a persisted snapshot without recomputing historical values."""
+        state = cls(
+            instrument=str(data.get("instrument", "")),
+            timestamp=float(data.get("timestamp", time.time())),
+            market_open=bool(data.get("market_open", False)),
+            scan_number=int(data.get("scan_number", 0)),
+            source=str(data.get("source", "snapshot")),
+        )
+        for name, value in data.get("dimensions", {}).items():
+            state.set_dimension(
+                name,
+                float(value.get("raw", 0.0)),
+                float(value.get("normalized", 0.0)),
+                float(value.get("velocity", 0.0)),
+                float(value.get("acceleration", 0.0)),
+            )
+        state.net_directional_bias = float(data.get("net_bias", data.get("net_directional_bias", 0.0)))
+        state.agreement_factor = float(data.get("agreement", data.get("agreement_factor", 0.0)))
+        state.regime = str(data.get("regime", "unknown"))
+        state.gex_regime = str(data.get("gex_regime", "unknown"))
+        state.dominant_category = str(data.get("dominant_category", ""))
+        if quality:
+            state.quality = StateQuality(
+                coverage=float(quality.get("coverage", 0.0)),
+                freshness_seconds=float(quality.get("freshness_seconds", 0.0)),
+                missing_dimensions=list(quality.get("missing_dimensions", [])),
+                populated_count=int(quality.get("populated_count", 0)),
+                declared_count=int(quality.get("declared_count", len(DIMENSIONS))),
+                category_coverage=dict(quality.get("category_coverage", {})),
+            )
+        else:
+            state.compute_quality()
+        return state
+
     # ──────────────────────────────────────────────────────────────────────────
     # SERIALIZATION (for AI model consumption + storage)
     # ──────────────────────────────────────────────────────────────────────────
     
-    def to_dict(self, include_raw: bool = False) -> dict:
+    def to_dict(self, include_raw: bool = False, include_quality: bool = False) -> dict:
         """Serialize for JSON / AI model context."""
         dims = {}
         for name, dv in self.dimensions.items():
@@ -273,7 +366,7 @@ class MarketState:
                 entry["acceleration"] = round(dv.acceleration, 4)
             dims[name] = entry
         
-        return {
+        result = {
             "instrument": self.instrument,
             "timestamp": self.timestamp,
             "market_open": self.market_open,
@@ -288,6 +381,9 @@ class MarketState:
             "contradictions": self.get_contradictions(),
             "velocity_alerts": self.get_velocity_alerts(),
         }
+        if include_quality:
+            result["quality"] = self.quality_dict()
+        return result
     
     def to_compact(self) -> dict:
         """Compact representation for AI prompts (minimize tokens)."""
