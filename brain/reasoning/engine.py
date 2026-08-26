@@ -48,12 +48,31 @@ class ReasoningEngine:
         # chain.to_prompt() = full reasoning for AI model
     """
     
-    def __init__(self, pattern_db: Optional[PatternDB] = None):
+    def __init__(self, pattern_db: Optional[PatternDB] = None,
+                 weight_table=None):
         self.evidence_builder = EvidenceChainBuilder()
         self.confidence_calc = ConfidenceCalculator()
         self.blunder_guard = BlunderGuard()
         self.pattern_matcher = PatternMatcher(pattern_db) if pattern_db else None
         self.pattern_db = pattern_db
+        # Learned multipliers. When present, they are applied to the state's
+        # DIRECTION weights before scoring, so learning reaches the score itself
+        # rather than only nudging the final number.
+        self.weight_table = weight_table
+
+    def apply_learned_weights(self, state: MarketState) -> MarketState:
+        """
+        Re-score `state` using the learned weight table, if one is attached.
+
+        Called at the start of reason() so every downstream consumer — evidence,
+        attribution, vetoes, fingerprint — sees the same weights.
+        """
+        if self.weight_table is None:
+            return state
+        resolver = self.weight_table.resolver(state.regime, state.gex_regime)
+        state.compute_composites(weight_resolver=resolver,
+                                 weight_version=self.weight_table.version)
+        return state
     
     def reason(
         self,
@@ -72,6 +91,10 @@ class ReasoningEngine:
         This is the main entry point. Returns everything: decision, confidence,
         evidence, risks, timing, vetoes — ready for AI model consumption.
         """
+        # Re-score with learned weights before anything reads the state, so the
+        # evidence chain, attribution and vetoes all see one consistent view.
+        state = self.apply_learned_weights(state)
+
         chain = EvidenceChain(
             instrument=state.instrument,
             timestamp=time.time(),

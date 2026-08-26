@@ -88,6 +88,13 @@ class MarketState:
     conviction_score: float = 0.0   # [0, 1]    unsigned multiplier
     net_directional_bias: float = 0.0  # direction_score * conviction_score * 100
     agreement_factor: float = 0.0  # 0-1, weighted share of DIRECTION dims agreeing
+
+    # Effective per-dimension weights actually used by compute_composites, after
+    # any learned multipliers. Attribution reads these rather than recomputing
+    # them, which is what keeps the decomposition reconciling with the score when
+    # learned weights are non-default.
+    effective_weights: dict[str, float] = field(default_factory=dict)
+    weight_table_version: int = 0
     regime: str = "unknown"  # Trending/Developing/Choppy
     gex_regime: str = "unknown"  # Positive/Negative/Unknown
     dominant_category: str = ""  # Which category is driving the signal most
@@ -135,9 +142,15 @@ class MarketState:
         """Return quality with freshness recalculated at read time."""
         return self.quality.to_dict(freshness_seconds=self.age_seconds)
 
-    def compute_composites(self):
+    def compute_composites(self, weight_resolver=None, weight_version: int = 0):
         """
         Compute the directional score, the conviction multiplier, and net bias.
+
+        `weight_resolver` is an optional callable `(dimension_name) -> multiplier`
+        supplied by a learned WeightTable. It defaults to identity, so an
+        untrained system scores exactly as the hand-specified weights intend.
+        Previously nothing could adjust these weights: learned values only nudged
+        the final confidence scalar, leaving the state scoring untouched.
 
             net_directional_bias = direction_score * conviction_score * 100
 
@@ -153,24 +166,43 @@ class MarketState:
         if not self.dimensions:
             return
 
+        self.weight_table_version = weight_version
+        self.effective_weights = {}
+
+        def eff_weight(name: str, base: float) -> float:
+            if weight_resolver is None:
+                return base
+            try:
+                m = float(weight_resolver(name))
+            except (TypeError, ValueError):
+                m = 1.0
+            if m != m or m <= 0:
+                m = 1.0
+            return base * m
+
         # ── DIRECTION: signed, category-weighted ─────────────────────────────
         category_scores: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
         category_populated_weight: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
         category_declared_weight: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
+        # Declared weight uses effective weights too, so a learned de-emphasis
+        # does not silently redistribute influence to the rest of the category.
         for definition in DIRECTION_DIMENSIONS.values():
             if definition.weight > 0:
-                category_declared_weight[definition.category.value] += definition.weight
+                w = eff_weight(definition.name, definition.weight)
+                self.effective_weights[definition.name] = w
+                category_declared_weight[definition.category.value] += w
 
         for dim_name, dim_val in self.dimensions.items():
             dim_def = DIRECTION_DIMENSIONS.get(dim_name)
             if not dim_def or dim_def.weight == 0:
                 continue
             cat = dim_def.category.value
+            w = self.effective_weights.get(dim_name, dim_def.weight)
             # Direction dimensions are signed; clamp defensively so a bad
             # normaliser cannot inject out-of-range influence.
             signed = max(-1.0, min(1.0, dim_val.normalized))
-            category_scores[cat] += signed * dim_def.weight
-            category_populated_weight[cat] += dim_def.weight
+            category_scores[cat] += signed * w
+            category_populated_weight[cat] += w
 
         direction = 0.0
         for cat_enum, cat_weight in DIRECTION_CATEGORY_WEIGHTS.items():
@@ -200,9 +232,10 @@ class MarketState:
             dim_def = DIRECTION_DIMENSIONS.get(dim_name)
             if not dim_def or dim_def.weight == 0 or dim_val.normalized == 0:
                 continue
-            active_w += dim_def.weight
+            w = self.effective_weights.get(dim_name, dim_def.weight)
+            active_w += w
             if (dim_val.normalized > 0) == (sign > 0):
-                agreeing_w += dim_def.weight
+                agreeing_w += w
         # Weight-based agreement so a weight-10 dimension is not outvoted by
         # three weight-3 ones.
         self.agreement_factor = (agreeing_w / active_w) if active_w > 0 else 0.0

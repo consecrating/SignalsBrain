@@ -144,12 +144,20 @@ def attribute(state: MarketState, direction: str,
         sign = 1 if state.direction_score >= 0 else -1
     att.direction_sign = sign
 
+    # Effective weights are read from the state, not recomputed. compute_composites
+    # records exactly what it used (including any learned multipliers), so the
+    # decomposition cannot drift away from the score it is meant to explain.
+    eff = state.effective_weights or {}
+
+    def weight_of(d) -> float:
+        return eff.get(d.name, d.weight)
+
     # Declared weight per direction category (missing dims contribute nothing
     # rather than letting a partial category claim full influence).
     declared: dict[str, float] = {}
     for d in DIRECTION_DIMENSIONS.values():
         if d.weight > 0:
-            declared[d.category.value] = declared.get(d.category.value, 0.0) + d.weight
+            declared[d.category.value] = declared.get(d.category.value, 0.0) + weight_of(d)
 
     scale = DIRECTION_POINTS * state.conviction_score
 
@@ -163,7 +171,7 @@ def attribute(state: MarketState, direction: str,
             continue
         signed = max(-1.0, min(1.0, dv.normalized))
         # Share of direction_score produced by this dimension.
-        share = (signed * d.weight / cat_declared) * cat_weight / 100.0
+        share = (signed * weight_of(d) / cat_declared) * cat_weight / 100.0
         # Points, oriented so that "agrees with the signal" is positive.
         points = share * scale * sign
         att.contributions.append(Contribution(
@@ -172,7 +180,7 @@ def attribute(state: MarketState, direction: str,
             category=d.category.value,
             normalized=signed,
             raw=dv.raw,
-            weight=d.weight,
+            weight=weight_of(d),
             points=points,
             supports_signal=points >= 0,
             velocity=dv.velocity,
