@@ -38,7 +38,12 @@ DB_PATH = Path(__file__).parent.parent.parent / "data" / "patterns.db"
 
 WIN_OUTCOMES = frozenset({"WIN_T1", "WIN_T2", "WIN_T3"})
 LOSS_OUTCOMES = frozenset({"STOP_LOSS"})
-COMPLETED_OUTCOMES = WIN_OUTCOMES | LOSS_OUTCOMES | {"TIME_EXIT", "NO_ENTRY"}
+# SCRATCH: a target was reached but the position round-tripped to entry. Booking
+# this as WIN_T1 (the previous behaviour) inflated every reported win rate, since
+# on an option a round trip after 45 minutes is a theta loss.
+NEUTRAL_OUTCOMES = frozenset({"SCRATCH"})
+COMPLETED_OUTCOMES = (WIN_OUTCOMES | LOSS_OUTCOMES | NEUTRAL_OUTCOMES
+                      | {"TIME_EXIT", "NO_ENTRY"})
 
 
 def outcome_semantic(outcome: str) -> str:
@@ -47,7 +52,7 @@ def outcome_semantic(outcome: str) -> str:
         return "win"
     if outcome in LOSS_OUTCOMES:
         return "loss"
-    if outcome == "TIME_EXIT":
+    if outcome in NEUTRAL_OUTCOMES or outcome == "TIME_EXIT":
         return "neutral"
     if outcome == "NO_ENTRY":
         return "excluded"
@@ -239,6 +244,18 @@ class PatternDB:
                 "pnl_pct": "REAL DEFAULT 0",
                 "vetoes_applied": "TEXT DEFAULT ''",
                 "evidence_summary": "TEXT DEFAULT ''",
+                # Provenance of pnl_pct: "observed" (real premiums), "modelled"
+                # (Black-Scholes mark) or "unavailable". Statistics must exclude
+                # unavailable rows rather than treating a placeholder as realised
+                # P&L, which is what the old `move_atr * 80` proxy did.
+                "pnl_source": "TEXT DEFAULT ''",
+                # Maximum favourable / adverse excursion in ATR units, so
+                # partial-target behaviour is measurable from the record.
+                "mfe_atr": "REAL DEFAULT 0",
+                "mae_atr": "REAL DEFAULT 0",
+                # Calibration model version that produced the emitted probability.
+                "calibration_version": "INTEGER DEFAULT 0",
+                "probability": "REAL DEFAULT 0",
             }
             existing = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
             for name, ddl in signal_columns.items():
@@ -360,12 +377,18 @@ class PatternDB:
                       entry_spot: float = 0, entry_premium: float = 0,
                       strike: float = 0, opt_type: str = "",
                       atr: float = 0, vetoes: list = None,
-                      evidence: str = "") -> int:
-        """Record a signal event and return its stable row id."""
+                      evidence: str = "", timestamp: Optional[float] = None) -> int:
+        """
+        Record a signal event and return its stable row id.
+
+        `timestamp` allows a replay to write the historical decision instant
+        rather than wall-clock now; without it every backtested row would be
+        stamped with the time the backtest ran, defeating the walk-forward guard.
+        """
         with self._conn() as conn:
             signal_id = self._insert_signal(
                 conn, state, direction, confidence, entry_spot, entry_premium,
-                strike, opt_type, atr, vetoes, evidence,
+                strike, opt_type, atr, vetoes, evidence, timestamp=timestamp,
             )
             conn.commit()
             return signal_id
@@ -629,9 +652,11 @@ class PatternDB:
         atr: float,
         vetoes: list | None,
         evidence: str,
+        timestamp: Optional[float] = None,
     ) -> int:
         fp = build_categorical_fingerprint(state)
         vec = state.fingerprint().tolist()
+        row_ts = time.time() if timestamp is None else float(timestamp)
         cursor = conn.execute("""
             INSERT INTO signals (
                 timestamp, instrument, direction, confidence, net_bias,
@@ -641,7 +666,7 @@ class PatternDB:
                 strike, opt_type, atr_at_entry, vetoes_applied, evidence_summary
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            time.time(), state.instrument, direction, confidence, state.net_directional_bias,
+            row_ts, state.instrument, direction, confidence, state.net_directional_bias,
             fp.gex_regime, fp.gex_flip_zone, fp.pcr_band, fp.adx_band, fp.trend_dir,
             fp.momentum_zone, fp.volume_state, fp.iv_regime, fp.vwap_pos, fp.session,
             fp.dte_band, fp.fii_dir, json.dumps(vec), entry_spot, entry_premium,
@@ -651,10 +676,20 @@ class PatternDB:
 
     def record_outcome(self, signal_id: int, outcome: str, exit_spot: float,
                        exit_premium: float, move_atr: float, duration_min: float,
-                       pnl_pct: float) -> SignalRecord:
-        """Close an open signal exactly once; only the winner emits side effects."""
+                       pnl_pct: Optional[float],
+                       pnl_source: str = "",
+                       mfe_atr: float = 0.0, mae_atr: float = 0.0) -> SignalRecord:
+        """
+        Close an open signal exactly once; only the winner emits side effects.
+
+        `pnl_pct` may be None: an unknown P&L is stored as NULL and excluded from
+        statistics, rather than substituted with a placeholder that later reads
+        as realised performance.
+        """
         if outcome not in COMPLETED_OUTCOMES:
             raise ValueError(f"Unsupported outcome: {outcome}")
+        if not pnl_source:
+            pnl_source = "observed" if pnl_pct is not None else "unavailable"
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
@@ -668,9 +703,11 @@ class PatternDB:
             cursor = conn.execute("""
                 UPDATE signals SET
                     outcome = ?, exit_spot = ?, exit_premium = ?,
-                    move_atr = ?, duration_minutes = ?, pnl_pct = ?
+                    move_atr = ?, duration_minutes = ?, pnl_pct = ?,
+                    pnl_source = ?, mfe_atr = ?, mae_atr = ?
                 WHERE id = ? AND outcome = ''
-            """, (outcome, exit_spot, exit_premium, move_atr, duration_min, pnl_pct, signal_id))
+            """, (outcome, exit_spot, exit_premium, move_atr, duration_min, pnl_pct,
+                  pnl_source, mfe_atr, mae_atr, signal_id))
             if cursor.rowcount != 1:
                 winner = conn.execute(
                     "SELECT outcome FROM signals WHERE id = ?", (signal_id,)
@@ -908,39 +945,62 @@ class PatternDB:
     # ──────────────────────────────────────────────────────────────────────────
     
     def find_similar(self, state, direction: str, min_match: float = 0.5,
-                     limit: Optional[int] = 50, instrument: Optional[str] = None) -> list[SignalRecord]:
+                     limit: Optional[int] = 50, instrument: Optional[str] = None,
+                     as_of: Optional[float] = None,
+                     require_pnl: bool = True) -> list[SignalRecord]:
         """
         Find historical signals with similar categorical fingerprints.
-        
-        This is THE key query: "What happened the last N times the market
-        looked like this?"
+
+        Three corrections to the original query:
+
+        1. **Soft matching.** `gex_regime` and `trend_dir` were equality filters.
+           `trend_dir` has 5 buckets and `gex_regime` 3, so a one-bucket drift
+           returned zero rows: measured on a populated database, an identical
+           state matched 12 rows while "gex flipped", "trend one band lower" and
+           "adx two bands away" each matched 0. The memory almost never recalled
+           anything. Both are now scored, not gated, and only `direction` remains
+           a hard filter.
+
+        2. **Score before limiting.** The old SQL applied `ORDER BY timestamp
+           DESC LIMIT limit*3` and only then computed the match score, so older
+           but better matches were discarded in favour of recent poor ones — a
+           recency sampling bias dressed up as similarity search.
+
+        3. **Walk-forward guard.** `as_of` excludes rows at or after the
+           evaluation instant. Without it, statistics could be computed from
+           trades that had not happened yet when the signal fired, which is the
+           classic leakage that makes a backtest look profitable.
         """
         fp = build_categorical_fingerprint(state)
-        
-        # Build flexible WHERE clause: match on the most important dimensions first
-        # then filter by match_score
-        where = ["direction = ?", "outcome != ''"]  # Only completed trades
+
+        where = ["direction = ?", "outcome != ''"]  # completed trades only
         params: list = [direction]
-        
+
         if instrument:
             where.append("instrument = ?")
             params.append(instrument)
-        
-        # Must match on these critical dimensions (hard filter)
-        where.append("gex_regime = ?")
-        params.append(fp.gex_regime)
-        where.append("trend_dir = ?")
-        params.append(fp.trend_dir)
-        
-        # Soft filter: ADX within 1 band
-        where.append("ABS(adx_band - ?) <= 1")
-        params.append(fp.adx_band)
-        
+
+        if as_of is not None:
+            # Strictly earlier than the decision instant.
+            where.append("timestamp < ?")
+            params.append(float(as_of))
+
+        if require_pnl:
+            # Exclude rows whose P&L could not be determined. Including them
+            # would let a placeholder read as realised performance.
+            where.append("(pnl_source IS NULL OR pnl_source != 'unavailable')")
+            where.append("pnl_pct IS NOT NULL")
+
+        # No hard filter on gex_regime / trend_dir / adx_band: they are scored
+        # below via relaxed_match_score, which already credits adjacent bands.
         sql = f"SELECT * FROM signals WHERE {' AND '.join(where)} ORDER BY timestamp DESC"
-        if limit is not None:
+        # Bound the scan so a large table cannot be read in full, but keep the
+        # cap far above `limit` so scoring has a real candidate pool.
+        scan_cap = None if limit is None else max(2000, limit * 40)
+        if scan_cap is not None:
             sql += " LIMIT ?"
-            params.append(limit * 3)  # Fetch extra, filter by score
-        
+            params.append(scan_cap)
+
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
@@ -966,14 +1026,16 @@ class PatternDB:
         return [rec for _, rec in (results[:limit] if limit is not None else results)]
     
     def get_pattern_stats(self, state, direction: str,
-                          instrument: Optional[str] = None) -> PatternStats:
+                          instrument: Optional[str] = None,
+                          as_of: Optional[float] = None) -> PatternStats:
         """
         Get comprehensive statistics for signals matching this state's pattern.
         
         This is what the AI model receives: not just "buy" but
         "buy — historically this exact setup won 72% of the time with avg +1.8 ATR move."
         """
-        matches = self.find_similar(state, direction, min_match=0.5, limit=None, instrument=instrument)
+        matches = self.find_similar(state, direction, min_match=0.5, limit=None,
+                                    instrument=instrument, as_of=as_of)
         
         if not matches:
             return PatternStats()

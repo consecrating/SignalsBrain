@@ -553,7 +553,11 @@ def test_outcome_tracker_progress_survives_t1_and_t2_restarts(tmp_path: Path):
     trade = restarted.outcome_tracker.active_trades[t1_signal["signal_id"]]
     assert trade.t1_hit is True
     assert trade.highest_premium == 15
-    assert restarted.outcome_tracker.check("NIFTY", 22000)[0]["outcome"] == "WIN_T1"
+    # Price reached T1 and then round-tripped all the way back to entry (22000).
+    # This is a SCRATCH, not a win. Booking it as WIN_T1 — the previous
+    # behaviour — counted a give-back as a win and inflated every reported win
+    # rate, because on an option the round trip has also paid theta throughout.
+    assert restarted.outcome_tracker.check("NIFTY", 22000)[0]["outcome"] == "SCRATCH"
 
     restarted.state_cache["NIFTY"] = make_state()
     restarted.reasoning_engine.reason = lambda *args, **kwargs: FakeChain()

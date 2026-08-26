@@ -238,13 +238,17 @@ class EvidenceChainBuilder:
                 finding=f"EMAs {'fully aligned bullish (9>21>50)' if ema.normalized > 0.7 else 'fully aligned bearish (9<21<50)' if ema.normalized < -0.7 else 'partially aligned ' + direction.value.lower()}",
                 direction=direction,
                 weight=weight,
-                confidence_impact=strength * 12,
+                # Signed, not abs(). Previously `strength * 12` used
+                # abs(normalized), so a BEARISH stack reported +4.80 and — because
+                # the old Stage 7 counted `impact > 0` as a confirmation — bearish
+                # evidence raised the confidence of a bullish signal.
+                confidence_impact=ema.normalized * 12,
                 raw_value=ema.normalized,
             ))
         
         # SuperTrend
         st = dims.get("supertrend")
-        if st:
+        if st and st.normalized != 0:
             direction = EvidenceDirection.BULLISH if st.normalized > 0 else EvidenceDirection.BEARISH
             ev.append(Evidence(
                 factor="SUPERTREND",
@@ -252,7 +256,8 @@ class EvidenceChainBuilder:
                 finding=f"SuperTrend is {'bullish' if st.normalized > 0 else 'bearish'}",
                 direction=direction,
                 weight=EvidenceWeight.MEDIUM,
-                confidence_impact=5 if abs(st.normalized) > 0 else 0,
+                # Was `5 if abs(normalized) > 0 else 0` — sign-blind, always +5.
+                confidence_impact=5 * (1 if st.normalized > 0 else -1),
                 raw_value=st.normalized,
             ))
         
@@ -421,7 +426,7 @@ class EvidenceChainBuilder:
                     factor="RSI_BEARISH", category="momentum",
                     finding=f"RSI {rsi.raw:.0f} — bearish momentum zone",
                     direction=EvidenceDirection.BEARISH, weight=EvidenceWeight.LOW,
-                    confidence_impact=3, raw_value=rsi.raw,
+                    confidence_impact=-3, raw_value=rsi.raw,
                 ))
         
         # RSI Divergence
@@ -492,9 +497,15 @@ class EvidenceChainBuilder:
         fii = dims.get("fii_flow")
         if fii and abs(fii.normalized) > 0.2:
             direction = EvidenceDirection.BULLISH if fii.normalized > 0 else EvidenceDirection.BEARISH
+            # The inner quotes were plain strings inside the f-string's
+            # conditional, so `{fii.raw:.0f}` was never interpolated and the
+            # literal text "Rs{fii.raw:.0f} Cr" reached the operator and the model.
+            flow_desc = (f"net buyers (Rs {fii.raw:,.0f} Cr)" if fii.raw > 0
+                         else f"net sellers (Rs {abs(fii.raw):,.0f} Cr)")
             ev.append(Evidence(
                 factor="FII_FLOW", category="flow",
-                finding=f"FII {'net buyers (₹{fii.raw:.0f} Cr)' if fii.raw > 0 else 'net sellers (₹{abs(fii.raw):.0f} Cr)'} — institutional {'accumulation' if fii.raw > 0 else 'distribution'}",
+                finding=f"FII {flow_desc} — institutional "
+                        f"{'accumulation' if fii.raw > 0 else 'distribution'}",
                 direction=direction,
                 weight=EvidenceWeight.MEDIUM,
                 confidence_impact=fii.normalized * 5, raw_value=fii.raw,
@@ -577,7 +588,7 @@ class EvidenceChainBuilder:
                     finding="Price at day's low (bottom 10%) — either breakdown or bounce zone",
                     direction=EvidenceDirection.BEARISH,
                     weight=EvidenceWeight.LOW,
-                    confidence_impact=2, raw_value=drp.raw,
+                    confidence_impact=-2, raw_value=drp.raw,
                 ))
         
         return ev

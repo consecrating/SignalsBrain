@@ -1,20 +1,53 @@
 """
 SignalsBrain — Dimension Definitions
 
-The 47 dimensions that define the complete market state at any instant.
+The dimensions that define the complete market state at any instant.
+
+## Channels (the central correctness invariant)
+
+Every dimension belongs to exactly one CHANNEL, and the channel decides how the
+dimension is allowed to influence a decision:
+
+  DIRECTION  — signed [-1,+1]. Carries genuine bull/bear meaning. These are the
+               ONLY inputs to the directional score.
+  CONVICTION — unsigned [0,1]. Carries "how much do we trust a directional read
+               right now" (trend strength, participation, volatility regime).
+               These SCALE the directional score. They never add to it.
+  CONTEXT    — gates and sizing inputs (clock, expiry, IV level, GEX geometry).
+               These never touch the directional score at all.
+
+Why this matters: previously ADX (trend *strength*, no direction), volatility
+magnitude, IV level, volume magnitude and even day-of-week were summed into a
+signed "directional" bias. That produced two systematic defects:
+
+  1. day_of_week normalised to [-1,+1] made Monday mechanically bearish and
+     Friday mechanically bullish, worth ~33 confidence points on identical
+     evidence.
+  2. adx_value/adx_regime were added as POSITIVE contributions, so a stronger
+     bear trend produced a WEAKER bearish signal (net_bias -17.8 at ADX 12 vs
+     -3.0 at ADX 50) — monotonically backwards.
+
+Splitting the channels fixes both by construction: a non-directional quantity
+has no way to express a direction.
+
 Each dimension has:
   - name: unique identifier
-  - category: grouping for analysis
-  - range: expected value range
-  - normalizer: function to map raw value to [-1, +1] for cross-comparison
-  - weight: how much this dimension matters for signal generation
+  - channel: DIRECTION / CONVICTION / CONTEXT
+  - category: grouping for analysis and reporting
+  - weight: importance within its channel (0-10)
   - velocity_relevant: whether rate-of-change matters (not just level)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Optional
 import math
+
+
+class Channel(str, Enum):
+    """How a dimension is permitted to influence the decision."""
+    DIRECTION = "direction"    # signed, drives bull/bear
+    CONVICTION = "conviction"  # unsigned, scales the directional read
+    CONTEXT = "context"        # gates / sizing only, never scores
 
 
 class DimensionCategory(str, Enum):
@@ -31,130 +64,263 @@ class DimensionCategory(str, Enum):
 class Dimension:
     name: str
     category: DimensionCategory
+    channel: Channel
     description: str
-    weight: float  # 0-10, how important for signal generation
-    velocity_relevant: bool = True  # Track rate-of-change?
+    weight: float  # 0-10, importance within its channel
+    velocity_relevant: bool = True
     min_val: float = -1.0
     max_val: float = 1.0
 
+    @property
+    def is_directional(self) -> bool:
+        return self.channel is Channel.DIRECTION
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALL 47 DIMENSIONS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 DIMENSIONS: dict[str, Dimension] = {}
 
 
-def _d(name: str, cat: DimensionCategory, desc: str, weight: float, vel: bool = True):
-    dim = Dimension(name=name, category=cat, description=desc, weight=weight, velocity_relevant=vel)
+def _d(name: str, cat: DimensionCategory, chan: Channel, desc: str,
+       weight: float, vel: bool = True) -> Dimension:
+    dim = Dimension(name=name, category=cat, channel=chan, description=desc,
+                    weight=weight, velocity_relevant=vel)
     DIMENSIONS[name] = dim
     return dim
 
 
-# ── Price Structure (8) ───────────────────────────────────────────────────────
-_d("ltp", DimensionCategory.PRICE, "Last traded price (absolute)", 0, vel=False)
-_d("day_change_pct", DimensionCategory.PRICE, "Intraday price change %", 6, vel=True)
-_d("day_range_position", DimensionCategory.PRICE, "Position within today's high-low range (0=low, 1=high)", 5, vel=True)
-_d("range_20d_position", DimensionCategory.PRICE, "Position within 20-day high-low range", 4, vel=False)
-_d("vwap_deviation", DimensionCategory.PRICE, "% deviation from VWAP (institutional benchmark)", 7, vel=True)
-_d("ema_distance", DimensionCategory.PRICE, "Composite distance from EMA9/21/50/200 (normalized)", 6, vel=True)
-_d("orb_status", DimensionCategory.PRICE, "Opening Range Breakout status (-1=breakdown, 0=inside, 1=breakout)", 5, vel=False)
-_d("sr_proximity", DimensionCategory.PRICE, "Distance to nearest swing S/R as fraction of ATR", 4, vel=False)
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIRECTION CHANNEL — signed, genuine bull/bear meaning
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Trend (7) ─────────────────────────────────────────────────────────────────
-_d("ema_stack_score", DimensionCategory.TREND, "EMA alignment score: +1=perfect bull stack, -1=perfect bear stack", 8, vel=True)
-_d("supertrend", DimensionCategory.TREND, "SuperTrend direction: +1=bullish, -1=bearish", 7, vel=False)
-_d("adx_value", DimensionCategory.TREND, "ADX trend strength (0-100)", 7, vel=True)
-_d("adx_regime", DimensionCategory.TREND, "Market regime: trending(+1)/developing(0)/choppy(-1)", 8, vel=False)
-_d("di_differential", DimensionCategory.TREND, "+DI minus -DI (directional strength)", 6, vel=True)
-_d("htf_trend", DimensionCategory.TREND, "Higher timeframe (1H) trend: +1=bull, -1=bear", 7, vel=False)
-_d("trend_acceleration", DimensionCategory.TREND, "Is ADX rising (+1) or falling (-1)?", 5, vel=False)
+# ── Price Structure ───────────────────────────────────────────────────────────
+_d("day_change_pct", DimensionCategory.PRICE, Channel.DIRECTION,
+   "Intraday price change % vs session open", 6)
+_d("day_range_position", DimensionCategory.PRICE, Channel.DIRECTION,
+   "Position within today's high-low range (-1=low, +1=high)", 5)
+_d("range_20d_position", DimensionCategory.PRICE, Channel.DIRECTION,
+   "Position within 20-day high-low range", 4, vel=False)
+_d("vwap_deviation", DimensionCategory.PRICE, Channel.DIRECTION,
+   "% deviation from session VWAP (institutional benchmark)", 7)
+_d("ema_distance", DimensionCategory.PRICE, Channel.DIRECTION,
+   "Composite signed distance from EMA9/21/50/200", 6)
+_d("orb_status", DimensionCategory.PRICE, Channel.DIRECTION,
+   "Opening Range Breakout status (-1=breakdown, 0=inside, +1=breakout)", 5, vel=False)
 
-# ── Momentum (6) ──────────────────────────────────────────────────────────────
-_d("rsi", DimensionCategory.MOMENTUM, "RSI(14) value normalized: >60=bull, <40=bear", 6, vel=True)
-_d("rsi_divergence", DimensionCategory.MOMENTUM, "Price-RSI divergence: +1=bullish div, -1=bearish div, 0=none", 7, vel=False)
-_d("macd_histogram", DimensionCategory.MOMENTUM, "MACD histogram value (normalized by ATR)", 6, vel=True)
-_d("macd_direction", DimensionCategory.MOMENTUM, "MACD hist expanding(+1) or contracting(-1)", 5, vel=False)
-_d("roc_5", DimensionCategory.MOMENTUM, "5-bar rate of change (%)", 5, vel=True)
-_d("stochastic_zone", DimensionCategory.MOMENTUM, "Stochastic %K zone: overbought(+1)/neutral(0)/oversold(-1)", 4, vel=True)
+# ── Trend ─────────────────────────────────────────────────────────────────────
+_d("ema_stack_score", DimensionCategory.TREND, Channel.DIRECTION,
+   "EMA alignment: +1=perfect bull stack, -1=perfect bear stack", 8)
+_d("supertrend", DimensionCategory.TREND, Channel.DIRECTION,
+   "SuperTrend direction: +1=bullish, -1=bearish", 7, vel=False)
+_d("di_differential", DimensionCategory.TREND, Channel.DIRECTION,
+   "+DI minus -DI (signed directional strength)", 6)
+_d("htf_trend", DimensionCategory.TREND, Channel.DIRECTION,
+   "Higher timeframe (1H) trend: +1=bull, -1=bear", 7, vel=False)
 
-# ── Options Microstructure (12) — THE EDGE NO HUMAN CAN TRACK ─────────────────
-_d("pcr", DimensionCategory.OPTIONS, "Put-Call Ratio from OI. >1.2=bullish support, <0.7=bearish", 9, vel=True)
-_d("pcr_velocity", DimensionCategory.OPTIONS, "Rate of PCR change (per scan). Rising=more puts writing=support building", 10, vel=False)
-_d("atm_iv", DimensionCategory.OPTIONS, "ATM implied volatility (%)", 6, vel=True)
-_d("iv_percentile", DimensionCategory.OPTIONS, "Current IV vs historical range (0-100)", 7, vel=False)
-_d("iv_skew", DimensionCategory.OPTIONS, "Put IV minus Call IV. Positive=fear/hedging, Negative=greed", 8, vel=True)
-_d("gex_regime", DimensionCategory.OPTIONS, "Gamma Exposure regime: +1=Positive(stabilize), -1=Negative(amplify)", 10, vel=False)
-_d("gex_net", DimensionCategory.OPTIONS, "Net GEX in ₹Cr (magnitude of dealer exposure)", 6, vel=True)
-_d("gex_flip_distance", DimensionCategory.OPTIONS, "Distance to GEX flip point in ATR units (signed: +above, -below)", 9, vel=True)
-_d("call_wall_distance", DimensionCategory.OPTIONS, "Distance to call wall (resistance magnet) in ATR", 5, vel=False)
-_d("put_wall_distance", DimensionCategory.OPTIONS, "Distance to put wall (support magnet) in ATR", 5, vel=False)
-_d("max_pain_distance", DimensionCategory.OPTIONS, "Distance to max pain level in ATR (signed)", 4, vel=False)
-_d("oi_buildup", DimensionCategory.OPTIONS, "OI buildup interpretation: long_buildup(+1)/short_covering(+0.5)/short_buildup(-1)/long_unwinding(-0.5)", 8, vel=True)
+# ── Momentum ──────────────────────────────────────────────────────────────────
+_d("rsi", DimensionCategory.MOMENTUM, Channel.DIRECTION,
+   "RSI(14) mapped signed: >60 bullish, <40 bearish", 6)
+_d("rsi_divergence", DimensionCategory.MOMENTUM, Channel.DIRECTION,
+   "Price-RSI divergence: +1=bullish div, -1=bearish div", 7, vel=False)
+_d("macd_histogram", DimensionCategory.MOMENTUM, Channel.DIRECTION,
+   "MACD histogram value (ATR-normalised)", 6)
+_d("macd_direction", DimensionCategory.MOMENTUM, Channel.DIRECTION,
+   "MACD histogram sign/expansion", 5, vel=False)
+_d("roc_5", DimensionCategory.MOMENTUM, Channel.DIRECTION,
+   "5-bar rate of change (%)", 5)
+_d("stochastic_zone", DimensionCategory.MOMENTUM, Channel.DIRECTION,
+   "Stochastic %K zone, signed", 4)
 
-# ── Volume & Flow (6) ─────────────────────────────────────────────────────────
-_d("volume_ratio", DimensionCategory.FLOW, "Current volume / 20-bar avg volume", 6, vel=True)
-_d("volume_trend", DimensionCategory.FLOW, "Volume accelerating(+1) or decelerating(-1)", 5, vel=False)
-_d("vwap_position", DimensionCategory.FLOW, "Above VWAP (+1) or below (-1)", 7, vel=True)
-_d("delivery_pct", DimensionCategory.FLOW, "Delivery % (high=conviction, low=speculation)", 3, vel=False)
-_d("fii_flow", DimensionCategory.FLOW, "FII net flow direction: buying(+1)/selling(-1)/neutral(0)", 7, vel=False)
-_d("dii_flow", DimensionCategory.FLOW, "DII net flow direction", 4, vel=False)
+# ── Options Microstructure ────────────────────────────────────────────────────
+_d("pcr", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "Put-Call Ratio from OI. High=put support building=bullish", 9)
+_d("pcr_velocity", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "Rate of PCR change. Rising=support building", 10, vel=False)
+_d("iv_skew", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "Put IV minus Call IV. Positive=fear/hedging=bearish", 8)
+_d("oi_buildup", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "OI buildup: long_buildup(+1)/short_covering(+.5)/short_buildup(-1)/long_unwinding(-.5)", 8)
+_d("call_wall_distance", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "Proximity to call wall (resistance magnet). Close=capped upside=bearish", 5, vel=False)
+_d("put_wall_distance", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "Proximity to put wall (support magnet). Close=support=bullish", 5, vel=False)
+_d("max_pain_distance", DimensionCategory.OPTIONS, Channel.DIRECTION,
+   "Signed distance to max pain; pin pull is toward max pain", 4, vel=False)
 
-# ── Volatility (4) ────────────────────────────────────────────────────────────
-_d("vix", DimensionCategory.VOLATILITY, "India VIX level", 6, vel=True)
-_d("vix_change", DimensionCategory.VOLATILITY, "VIX change today (rising=fear, falling=complacency)", 7, vel=True)
-_d("bb_width", DimensionCategory.VOLATILITY, "Bollinger Band width % (squeeze < 1.5%)", 5, vel=True)
-_d("atr_pct", DimensionCategory.VOLATILITY, "ATR as % of price (market alive/dead threshold)", 6, vel=False)
-
-# ── Time & Context (4) ────────────────────────────────────────────────────────
-_d("session_minutes", DimensionCategory.CONTEXT, "Minutes since market open (0-375)", 3, vel=False)
-_d("dte", DimensionCategory.CONTEXT, "Days to nearest expiry", 6, vel=False)
-_d("day_of_week", DimensionCategory.CONTEXT, "Day (1=Mon...5=Fri). Expiry days have different character.", 3, vel=False)
-_d("session_phase", DimensionCategory.CONTEXT, "Phase: opening(0-15min)/morning(15-120)/midday(120-240)/afternoon(240-330)/closing(330-375)", 4, vel=False)
+# ── Volume & Flow ─────────────────────────────────────────────────────────────
+_d("vwap_position", DimensionCategory.FLOW, Channel.DIRECTION,
+   "Above VWAP (+1) or below (-1)", 7)
+_d("fii_flow", DimensionCategory.FLOW, Channel.DIRECTION,
+   "FII net flow direction: buying(+1)/selling(-1)", 7, vel=False)
+_d("dii_flow", DimensionCategory.FLOW, Channel.DIRECTION,
+   "DII net flow direction", 4, vel=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# NORMALIZERS — map raw values to [-1, +1] for cross-comparison
+# CONVICTION CHANNEL — unsigned [0,1], scales the directional read
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_d("adx_value", DimensionCategory.TREND, Channel.CONVICTION,
+   "ADX trend STRENGTH (0-100). Direction-free.", 8)
+_d("adx_regime", DimensionCategory.TREND, Channel.CONVICTION,
+   "Regime: trending/developing/choppy. Direction-free.", 7, vel=False)
+_d("trend_acceleration", DimensionCategory.TREND, Channel.CONVICTION,
+   "Is ADX rising (trend building) or falling (trend decaying)?", 5, vel=False)
+_d("volume_ratio", DimensionCategory.FLOW, Channel.CONVICTION,
+   "Current volume / 20-bar average. Participation, not direction.", 6)
+_d("volume_trend", DimensionCategory.FLOW, Channel.CONVICTION,
+   "Volume accelerating or decelerating", 5, vel=False)
+_d("delivery_pct", DimensionCategory.FLOW, Channel.CONVICTION,
+   "Delivery % (high=conviction, low=speculation)", 3, vel=False)
+_d("atr_pct", DimensionCategory.VOLATILITY, Channel.CONVICTION,
+   "ATR as % of price. Is the market alive enough to reach a target?", 7, vel=False)
+_d("bb_width", DimensionCategory.VOLATILITY, Channel.CONVICTION,
+   "Bollinger Band width % (squeeze = coiled energy)", 5)
+_d("gex_regime", DimensionCategory.OPTIONS, Channel.CONVICTION,
+   "Gamma regime: Negative=dealers amplify (raises conviction), "
+   "Positive=dealers suppress (lowers conviction). Direction-free.", 10, vel=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTEXT CHANNEL — gates and sizing only. Never scores.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_d("ltp", DimensionCategory.PRICE, Channel.CONTEXT, "Last traded price (absolute)", 0, vel=False)
+_d("sr_proximity", DimensionCategory.PRICE, Channel.CONTEXT,
+   "Unsigned distance to nearest swing S/R in ATR units", 4, vel=False)
+_d("atr_percentile", DimensionCategory.VOLATILITY, Channel.CONTEXT,
+   "ATR% ranked against this instrument's own recent history (0-1). Timeframe-"
+   "agnostic liveness gate; a fixed ATR% threshold is interval-dependent.", 0, vel=False)
+_d("gex_net", DimensionCategory.OPTIONS, Channel.CONTEXT,
+   "Net GEX magnitude (Rs Cr) — size of dealer exposure", 6)
+_d("gex_flip_distance", DimensionCategory.OPTIONS, Channel.CONTEXT,
+   "Distance to GEX flip in ATR units — regime-transition geometry", 9)
+_d("atm_iv", DimensionCategory.OPTIONS, Channel.CONTEXT, "ATM implied volatility (%)", 6)
+_d("iv_percentile", DimensionCategory.OPTIONS, Channel.CONTEXT,
+   "Current IV vs its own history (0-100) — cost of optionality", 7, vel=False)
+_d("vix", DimensionCategory.VOLATILITY, Channel.CONTEXT, "India VIX level", 6)
+_d("vix_change", DimensionCategory.VOLATILITY, Channel.CONTEXT,
+   "VIX change today — risk gate, not a direction", 7)
+_d("session_minutes", DimensionCategory.CONTEXT, Channel.CONTEXT,
+   "Minutes since market open (0-375)", 3, vel=False)
+_d("dte", DimensionCategory.CONTEXT, Channel.CONTEXT, "Days to nearest expiry", 6, vel=False)
+_d("day_of_week", DimensionCategory.CONTEXT, Channel.CONTEXT,
+   "Day (1=Mon..5=Fri). Expiry days differ in character.", 3, vel=False)
+_d("session_phase", DimensionCategory.CONTEXT, Channel.CONTEXT,
+   "opening/morning/midday/afternoon/closing", 4, vel=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANNEL INDEXES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DIRECTION_DIMENSIONS = {n: d for n, d in DIMENSIONS.items() if d.channel is Channel.DIRECTION}
+CONVICTION_DIMENSIONS = {n: d for n, d in DIMENSIONS.items() if d.channel is Channel.CONVICTION}
+CONTEXT_DIMENSIONS = {n: d for n, d in DIMENSIONS.items() if d.channel is Channel.CONTEXT}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NORMALIZERS — all clamped and overflow-safe
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# math.exp overflows above ~709. Clamping the logistic argument well inside that
+# bound keeps normalize_pct total: previously a large negative input (reachable
+# whenever two scans arrived close together, since velocity divides by elapsed
+# wall-clock time) raised OverflowError and turned POST /brain/ingest into a 500.
+_LOGISTIC_CLAMP = 60.0
+
+
+def _safe_logistic(x: float) -> float:
+    """Logistic mapped to [-1,+1], saturating instead of overflowing."""
+    if x != x:  # NaN
+        return 0.0
+    if x >= _LOGISTIC_CLAMP:
+        return 1.0
+    if x <= -_LOGISTIC_CLAMP:
+        return -1.0
+    return 2.0 / (1.0 + math.exp(-x)) - 1.0
+
 
 def normalize_pct(value: float, center: float = 0, scale: float = 2.0) -> float:
-    """Sigmoid-like normalization centered at `center`, scaled by `scale`."""
-    x = (value - center) / scale
-    return max(-1.0, min(1.0, 2 / (1 + math.exp(-x)) - 1))
+    """Signed logistic normalisation centred at `center`, scaled by `scale`."""
+    if scale == 0 or scale != scale:
+        return 0.0
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return _safe_logistic((value - center) / scale)
 
 
 def normalize_range(value: float, lo: float, hi: float) -> float:
-    """Linear map [lo, hi] → [-1, +1]."""
-    if hi <= lo:
+    """Linear map [lo, hi] -> [-1, +1], clamped."""
+    if hi <= lo or value != value:
         return 0.0
     return max(-1.0, min(1.0, 2 * (value - lo) / (hi - lo) - 1))
 
 
+def normalize_unit(value: float, lo: float, hi: float) -> float:
+    """Linear map [lo, hi] -> [0, 1], clamped. For CONVICTION dimensions."""
+    if hi <= lo or value != value:
+        return 0.0
+    return max(0.0, min(1.0, (value - lo) / (hi - lo)))
+
+
 def normalize_threshold(value: float, bearish_thresh: float, bullish_thresh: float) -> float:
     """Below bearish = -1, above bullish = +1, linear between."""
+    if value != value:
+        return 0.0
     if value <= bearish_thresh:
         return -1.0
     if value >= bullish_thresh:
         return 1.0
     mid = (bearish_thresh + bullish_thresh) / 2
     half = (bullish_thresh - bearish_thresh) / 2
+    if half == 0:
+        return 0.0
     return (value - mid) / half
 
 
+def normalize_percentile(value: float, history: list[float]) -> float:
+    """
+    Rank `value` against its own recent distribution -> [-1, +1].
+
+    Replaces hard-coded saturating thresholds. normalize_threshold(pcr, 0.7, 1.2)
+    pins every reading above 1.2 to exactly +1.0, so a genuine move from 1.2 to
+    1.6 registered as zero change and was invisible to velocity. A percentile
+    rank keeps those readings distinguishable and self-adjusts per instrument.
+    """
+    if not history:
+        return 0.0
+    clean = [h for h in history if h == h]
+    if not clean:
+        return 0.0
+    below = sum(1 for h in clean if h < value)
+    equal = sum(1 for h in clean if h == value)
+    pct = (below + 0.5 * equal) / len(clean)
+    return max(-1.0, min(1.0, pct * 2 - 1))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# DIMENSION WEIGHTS (for composite scoring)
-# Categories contribute to the total signal score weighted by their domain:
+# CATEGORY WEIGHTS
+#
+# Only DIRECTION categories contribute to the directional score. Volatility and
+# time_context are deliberately absent: they hold no directional dimensions.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CATEGORY_WEIGHTS = {
-    DimensionCategory.PRICE: 15,
-    DimensionCategory.TREND: 20,
-    DimensionCategory.MOMENTUM: 10,
-    DimensionCategory.OPTIONS: 25,  # THE key edge — no human can process this in real-time
-    DimensionCategory.FLOW: 12,
-    DimensionCategory.VOLATILITY: 8,
-    DimensionCategory.CONTEXT: 10,
+DIRECTION_CATEGORY_WEIGHTS = {
+    DimensionCategory.PRICE: 18,
+    DimensionCategory.TREND: 22,
+    DimensionCategory.MOMENTUM: 14,
+    DimensionCategory.OPTIONS: 30,   # the structural edge
+    DimensionCategory.FLOW: 16,
 }
+assert sum(DIRECTION_CATEGORY_WEIGHTS.values()) == 100
 
-# Total = 100
-assert sum(CATEGORY_WEIGHTS.values()) == 100
+# Retained under the original name for backward compatibility with existing
+# imports. It now contains only directional categories.
+CATEGORY_WEIGHTS = dict(DIRECTION_CATEGORY_WEIGHTS)
+
+
+def directional_weight_total() -> float:
+    return sum(d.weight for d in DIRECTION_DIMENSIONS.values())
+
+
+def conviction_weight_total() -> float:
+    return sum(d.weight for d in CONVICTION_DIMENSIONS.values())

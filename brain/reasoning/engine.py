@@ -48,12 +48,31 @@ class ReasoningEngine:
         # chain.to_prompt() = full reasoning for AI model
     """
     
-    def __init__(self, pattern_db: Optional[PatternDB] = None):
+    def __init__(self, pattern_db: Optional[PatternDB] = None,
+                 weight_table=None):
         self.evidence_builder = EvidenceChainBuilder()
         self.confidence_calc = ConfidenceCalculator()
         self.blunder_guard = BlunderGuard()
         self.pattern_matcher = PatternMatcher(pattern_db) if pattern_db else None
         self.pattern_db = pattern_db
+        # Learned multipliers. When present, they are applied to the state's
+        # DIRECTION weights before scoring, so learning reaches the score itself
+        # rather than only nudging the final number.
+        self.weight_table = weight_table
+
+    def apply_learned_weights(self, state: MarketState) -> MarketState:
+        """
+        Re-score `state` using the learned weight table, if one is attached.
+
+        Called at the start of reason() so every downstream consumer — evidence,
+        attribution, vetoes, fingerprint — sees the same weights.
+        """
+        if self.weight_table is None:
+            return state
+        resolver = self.weight_table.resolver(state.regime, state.gex_regime)
+        state.compute_composites(weight_resolver=resolver,
+                                 weight_version=self.weight_table.version)
+        return state
     
     def reason(
         self,
@@ -64,6 +83,7 @@ class ReasoningEngine:
         live_premium_cost: float = 0,
         capital: float = 200000,
         confidence_threshold: float = 60,
+        as_of: Optional[float] = None,
     ) -> EvidenceChain:
         """
         Produce a complete reasoning chain for the current market state.
@@ -71,6 +91,10 @@ class ReasoningEngine:
         This is the main entry point. Returns everything: decision, confidence,
         evidence, risks, timing, vetoes — ready for AI model consumption.
         """
+        # Re-score with learned weights before anything reads the state, so the
+        # evidence chain, attribution and vetoes all see one consistent view.
+        state = self.apply_learned_weights(state)
+
         chain = EvidenceChain(
             instrument=state.instrument,
             timestamp=time.time(),
@@ -88,7 +112,11 @@ class ReasoningEngine:
         # ── Step 3: Get historical context ────────────────────────────────────
         hist_ctx = HistoricalContext()
         if self.pattern_matcher and direction != "NO_TRADE":
-            hist_ctx = self.pattern_matcher.get_context(state, direction)
+            # `as_of` enforces the walk-forward guard: statistics may only be
+            # drawn from trades that had already resolved when this signal fired.
+            hist_ctx = self.pattern_matcher.get_context(
+                state, direction, as_of=as_of if as_of is not None else state.timestamp
+            )
         
         # ── Step 4: Calculate confidence (multi-stage) ────────────────────────
         gex_flip_dist = 999.0
@@ -101,16 +129,15 @@ class ReasoningEngine:
         if htf_dim and htf_dim.normalized != 0 and direction != "NO_TRADE":
             htf_aligned = (htf_dim.normalized > 0 and direction == "BUY") or (htf_dim.normalized < 0 and direction == "SELL")
         
-        conf_breakdown = self.confidence_calc.calculate(
-            net_bias=net,
-            agreement=state.agreement_factor,
-            evidence=all_evidence,
-            regime=state.regime,
-            gex_regime=state.gex_regime,
-            gex_flip_distance_atr=gex_flip_dist,
+        # Exact attribution: confidence is the sum of the per-dimension
+        # contributions plus agreement plus the external terms. The evidence
+        # chain below explains the same arithmetic that produced this number,
+        # instead of running a second, decorative calculation alongside it.
+        conf_breakdown = self.confidence_calc.calculate_from_state(
+            state=state,
+            direction=direction,
             historical_modifier=hist_ctx.confidence_modifier,
             historical_explanation=hist_ctx.confidence_reason,
-            htf_aligned=htf_aligned,
             coverage=state.quality.coverage,
         )
         confidence = conf_breakdown.final

@@ -62,7 +62,28 @@ class BlunderGuard:
             return d.normalized if d else default
         
         gex_regime = state.gex_regime
-        session_min = raw("session_minutes", 120)
+
+        # StateBuilder stores -1 for session_minutes when the market is shut.
+        # Previously session_minutes was clamped with max(0, ...), so every
+        # pre-open moment looked like "minute 0" and tripped OPENING_CHAOS as a
+        # HARD veto. That made the engine incapable of emitting a signal outside
+        # 09:30-15:15 IST, which in turn made backtesting and pattern-memory
+        # seeding impossible. Now "market closed" is its own explicit state.
+        session_min = raw("session_minutes", -1.0)
+        market_closed = (not state.market_open) or session_min < 0
+
+        if market_closed:
+            vetoes.append(Veto(
+                name="MARKET_CLOSED",
+                rule_number=0,
+                severity="HARD",
+                description="Market is closed (outside 09:15-15:30 IST on a weekday). "
+                            "No new entries.",
+                learned_from="Structural: there is no liquidity to trade against.",
+            ))
+            # Session-phase rules are meaningless with no session; skip them and
+            # evaluate only the state-based rules below.
+            session_min = None
         adx = raw("adx_value", 20)
         atr_pct = raw("atr_pct", 0.5)
         rsi = raw("rsi", 50)
@@ -88,7 +109,7 @@ class BlunderGuard:
         # RULE 2: LATE SESSION (extended to 3:15 PM per user request)
         # Learned from: Theta crush + illiquidity in last 15 minutes
         # ══════════════════════════════════════════════════════════════════════
-        if session_min >= 360:  # 3:15 PM = 09:15 + 360 min
+        if session_min is not None and session_min >= 360:  # 3:15 PM = 09:15 + 360 min
             vetoes.append(Veto(
                 name="LATE_SESSION",
                 rule_number=2,
@@ -143,7 +164,7 @@ class BlunderGuard:
         # RULE 5: OPENING CHAOS (first 15 minutes)
         # Learned from: Gap fills and fake moves in first 15 min
         # ══════════════════════════════════════════════════════════════════════
-        if session_min <= 15:
+        if session_min is not None and session_min <= 15:
             vetoes.append(Veto(
                 name="OPENING_CHAOS",
                 rule_number=5,
@@ -241,13 +262,51 @@ class BlunderGuard:
         # RULE 11: DEAD MARKET
         # Learned from: Buying options in a flat market = pure theta loss
         # ══════════════════════════════════════════════════════════════════════
-        if atr_pct < 0.25:
+        # "Dead" must mean "unusually quiet for this instrument on this
+        # timeframe", not "below a fixed percentage".
+        #
+        # The original test was `atr_pct < 0.25`, which is a DAILY-bar threshold.
+        # Measured on real NIFTY bars from the production proxy, median ATR% is
+        # 0.0245 on 1-minute, 0.0548 on 5-minute and 0.1118 on 15-minute bars —
+        # so 100% of intraday bars tripped it. As a HARD veto that made the engine
+        # incapable of emitting any intraday signal, which is the only thing it is
+        # designed to do. A synthetic feed with per-bar vol of 0.0025 sat just
+        # above the threshold and hid this entirely.
+        #
+        # atr_percentile ranks ATR% against the instrument's own recent history,
+        # so the rule is timeframe-agnostic and self-calibrating.
+        atr_pctl = raw("atr_percentile", -1.0)
+        if atr_pctl >= 0.0:
+            if atr_pctl <= 0.10:
+                vetoes.append(Veto(
+                    name="DEAD_MARKET",
+                    rule_number=11,
+                    severity="HARD",
+                    description=(
+                        f"ATR {atr_pct:.3f}% of price is in the bottom "
+                        f"{atr_pctl*100:.0f}th percentile of this instrument's own "
+                        f"recent range. Unusually quiet — premiums decay faster "
+                        f"than spot moves."
+                    ),
+                    learned_from="Trades taken in the quietest decile lost money to "
+                                 "theta before the target was reached.",
+                ))
+        elif atr_pct > 0 and atr_pct < 0.02:
+            # Not enough history to rank yet. Fall back to an absolute floor an
+            # order of magnitude below the 1-minute median, so it catches a truly
+            # frozen tape without blocking a normal session. Deliberately
+            # fail-open: a wrong HARD veto here suppresses everything, which is a
+            # worse failure than admitting one marginal signal.
             vetoes.append(Veto(
                 name="DEAD_MARKET",
                 rule_number=11,
                 severity="HARD",
-                description=f"ATR only {atr_pct:.2f}% of price. Market too quiet — premiums decay faster than spot moves.",
-                learned_from="Every trade taken when ATR < 0.25% lost money to theta before target was reached.",
+                description=(
+                    f"ATR only {atr_pct:.4f}% of price and insufficient history to "
+                    f"rank it. Tape appears frozen."
+                ),
+                learned_from="Absolute floor used only until ~30 samples of ATR% "
+                             "history exist for this instrument.",
             ))
         
         # ══════════════════════════════════════════════════════════════════════

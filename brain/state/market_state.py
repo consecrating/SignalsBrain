@@ -21,7 +21,10 @@ from typing import Optional
 
 import numpy as np
 
-from .dimensions import DIMENSIONS, DimensionCategory, CATEGORY_WEIGHTS
+from .dimensions import (
+    DIMENSIONS, DimensionCategory, CATEGORY_WEIGHTS, Channel,
+    DIRECTION_DIMENSIONS, CONVICTION_DIMENSIONS, DIRECTION_CATEGORY_WEIGHTS,
+)
 
 
 @dataclass
@@ -79,8 +82,19 @@ class MarketState:
     market_open: bool = False
     
     # Derived composites (computed after all dimensions are set)
-    net_directional_bias: float = 0.0  # [-100, +100]
-    agreement_factor: float = 0.0  # 0-1 (how many dimensions agree on direction)
+    # The two orthogonal channels, exposed so callers can reason about them
+    # separately instead of only seeing the product.
+    direction_score: float = 0.0    # [-1, +1]  signed, bull/bear only
+    conviction_score: float = 0.0   # [0, 1]    unsigned multiplier
+    net_directional_bias: float = 0.0  # direction_score * conviction_score * 100
+    agreement_factor: float = 0.0  # 0-1, weighted share of DIRECTION dims agreeing
+
+    # Effective per-dimension weights actually used by compute_composites, after
+    # any learned multipliers. Attribution reads these rather than recomputing
+    # them, which is what keeps the decomposition reconciling with the score when
+    # learned weights are non-default.
+    effective_weights: dict[str, float] = field(default_factory=dict)
+    weight_table_version: int = 0
     regime: str = "unknown"  # Trending/Developing/Choppy
     gex_regime: str = "unknown"  # Positive/Negative/Unknown
     dominant_category: str = ""  # Which category is driving the signal most
@@ -128,64 +142,108 @@ class MarketState:
         """Return quality with freshness recalculated at read time."""
         return self.quality.to_dict(freshness_seconds=self.age_seconds)
 
-    def compute_composites(self):
-        """Calculate net bias, agreement, regime from all dimensions."""
+    def compute_composites(self, weight_resolver=None, weight_version: int = 0):
+        """
+        Compute the directional score, the conviction multiplier, and net bias.
+
+        `weight_resolver` is an optional callable `(dimension_name) -> multiplier`
+        supplied by a learned WeightTable. It defaults to identity, so an
+        untrained system scores exactly as the hand-specified weights intend.
+        Previously nothing could adjust these weights: learned values only nudged
+        the final confidence scalar, leaving the state scoring untouched.
+
+            net_directional_bias = direction_score * conviction_score * 100
+
+        Only DIRECTION-channel dimensions may influence direction_score. Only
+        CONVICTION-channel dimensions may influence conviction_score. CONTEXT
+        dimensions influence neither — they are gates handled downstream.
+
+        This is the invariant that removes the two structural defects:
+        the clock can no longer express a direction, and trend STRENGTH (ADX)
+        now amplifies whatever direction the signed dimensions actually show
+        instead of adding a spurious bullish contribution.
+        """
         if not self.dimensions:
             return
-        
-        # Net directional bias: weighted sum of all normalized dimensions
-        # Each dimension contributes: normalized_value × dimension_weight × category_weight
+
+        self.weight_table_version = weight_version
+        self.effective_weights = {}
+
+        def eff_weight(name: str, base: float) -> float:
+            if weight_resolver is None:
+                return base
+            try:
+                m = float(weight_resolver(name))
+            except (TypeError, ValueError):
+                m = 1.0
+            if m != m or m <= 0:
+                m = 1.0
+            return base * m
+
+        # ── DIRECTION: signed, category-weighted ─────────────────────────────
         category_scores: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
         category_populated_weight: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
         category_declared_weight: dict[str, float] = {cat.value: 0.0 for cat in DimensionCategory}
-        for definition in DIMENSIONS.values():
+        # Declared weight uses effective weights too, so a learned de-emphasis
+        # does not silently redistribute influence to the rest of the category.
+        for definition in DIRECTION_DIMENSIONS.values():
             if definition.weight > 0:
-                category_declared_weight[definition.category.value] += definition.weight
-        
+                w = eff_weight(definition.name, definition.weight)
+                self.effective_weights[definition.name] = w
+                category_declared_weight[definition.category.value] += w
+
         for dim_name, dim_val in self.dimensions.items():
-            dim_def = DIMENSIONS.get(dim_name)
+            dim_def = DIRECTION_DIMENSIONS.get(dim_name)
             if not dim_def or dim_def.weight == 0:
                 continue
-            
-            # Dimension contributes its normalized value × its weight within its category
             cat = dim_def.category.value
-            category_scores[cat] += dim_val.normalized * dim_def.weight
-            category_populated_weight[cat] += dim_def.weight
-        
-        # Normalize each category to [-1, +1], then apply category weights
-        net = 0.0
-        for cat_enum in DimensionCategory:
-            cat = cat_enum.value
-            declared_weight = category_declared_weight.get(cat, 0)
+            w = self.effective_weights.get(dim_name, dim_def.weight)
+            # Direction dimensions are signed; clamp defensively so a bad
+            # normaliser cannot inject out-of-range influence.
+            signed = max(-1.0, min(1.0, dim_val.normalized))
+            category_scores[cat] += signed * w
+            category_populated_weight[cat] += w
+
+        direction = 0.0
+        for cat_enum, cat_weight in DIRECTION_CATEGORY_WEIGHTS.items():
+            declared_weight = category_declared_weight.get(cat_enum.value, 0)
             if declared_weight > 0:
-                # Missing dimensions contribute no evidence rather than allowing a
-                # partial category to receive its full configured influence.
-                cat_bias = category_scores[cat] / declared_weight
-                net += cat_bias * CATEGORY_WEIGHTS.get(cat_enum, 0)
-        
-        # net is now in [-100, +100]
-        self.net_directional_bias = max(-100, min(100, net))
-        
-        # Agreement: how many dimensions agree with the dominant direction
-        direction = 1 if net >= 0 else -1
-        agreeing = 0
-        total_active = 0
+                # Missing dimensions contribute no evidence rather than letting a
+                # partly-populated category claim its full configured influence.
+                cat_bias = category_scores[cat_enum.value] / declared_weight
+                direction += cat_bias * cat_weight
+        self.direction_score = max(-1.0, min(1.0, direction / 100.0))
+
+        # ── CONVICTION: unsigned multiplier ──────────────────────────────────
+        self.conviction_score = self._compute_conviction()
+
+        # ── NET BIAS ─────────────────────────────────────────────────────────
+        net = self.direction_score * self.conviction_score * 100.0
+        self.net_directional_bias = max(-100.0, min(100.0, net))
+
+        # ── AGREEMENT: only directional dimensions may vote ──────────────────
+        # Previously every populated dimension voted, so three clock dimensions
+        # flipping sign mechanically rewrote agreement (0.50 -> 1.00 on identical
+        # market evidence) while carrying weight 42 in the confidence formula.
+        sign = 1 if self.direction_score >= 0 else -1
+        agreeing_w = 0.0
+        active_w = 0.0
         for dim_name, dim_val in self.dimensions.items():
-            dim_def = DIMENSIONS.get(dim_name)
-            if not dim_def or dim_def.weight == 0:
+            dim_def = DIRECTION_DIMENSIONS.get(dim_name)
+            if not dim_def or dim_def.weight == 0 or dim_val.normalized == 0:
                 continue
-            if dim_val.normalized == 0:
-                continue
-            total_active += 1
-            if (dim_val.normalized > 0 and direction > 0) or (dim_val.normalized < 0 and direction < 0):
-                agreeing += 1
-        
-        self.agreement_factor = agreeing / max(1, total_active)
-        
-        # Find dominant category
+            w = self.effective_weights.get(dim_name, dim_def.weight)
+            active_w += w
+            if (dim_val.normalized > 0) == (sign > 0):
+                agreeing_w += w
+        # Weight-based agreement so a weight-10 dimension is not outvoted by
+        # three weight-3 ones.
+        self.agreement_factor = (agreeing_w / active_w) if active_w > 0 else 0.0
+
+        # ── Dominant directional category ────────────────────────────────────
         max_cat = ""
-        max_cat_abs = 0
-        for cat_enum in DimensionCategory:
+        max_cat_abs = 0.0
+        for cat_enum in DIRECTION_CATEGORY_WEIGHTS:
             cat = cat_enum.value
             declared_weight = category_declared_weight.get(cat, 0)
             if declared_weight > 0 and category_populated_weight.get(cat, 0) > 0:
@@ -194,8 +252,48 @@ class MarketState:
                     max_cat_abs = cat_abs
                     max_cat = cat
         self.dominant_category = max_cat
-        
-        # Regime from ADX dimension
+
+        # ── Regime labels ────────────────────────────────────────────────────
+        self._derive_regimes()
+
+    def _compute_conviction(self) -> float:
+        """
+        Unsigned [0,1] multiplier: how much should we trust a directional read?
+
+        Neutral (no conviction data) is 0.65 rather than 0 or 1, so a state with
+        no conviction inputs degrades gracefully instead of zeroing the signal
+        or claiming perfect confidence.
+        """
+        NEUTRAL = 0.65
+        total_w = 0.0
+        acc = 0.0
+        for dim_name, dim_val in self.dimensions.items():
+            dim_def = CONVICTION_DIMENSIONS.get(dim_name)
+            if not dim_def or dim_def.weight == 0:
+                continue
+            # Conviction dimensions are stored unsigned in [0,1]. Tolerate
+            # legacy signed values by folding them into [0,1].
+            v = dim_val.normalized
+            v = (v + 1.0) / 2.0 if v < 0 else min(1.0, v)
+            acc += v * dim_def.weight
+            total_w += dim_def.weight
+        if total_w == 0:
+            return NEUTRAL
+        raw = acc / total_w  # [0,1]
+        # Blend toward neutral by how much conviction evidence we actually have,
+        # so one populated dimension cannot swing the multiplier to an extreme.
+        declared = sum(d.weight for d in CONVICTION_DIMENSIONS.values() if d.weight > 0)
+        completeness = min(1.0, total_w / declared) if declared else 0.0
+        blended = NEUTRAL + (raw - NEUTRAL) * completeness
+        # Floor at 0.25: even a dead market retains a little signal value so
+        # ranking still works; the DEAD_MARKET veto handles the hard block.
+        return max(0.25, min(1.0, blended))
+
+    def _derive_regimes(self):
+        """Derive the human-readable regime labels from their source dimensions."""
+        # adx_regime is a CONVICTION dimension: `raw` keeps the signed band
+        # (-1 choppy / 0 developing / +1 trending) while `normalized` is the
+        # unsigned [0,1] multiplier contribution.
         adx_dim = self.dimensions.get("adx_regime")
         if adx_dim:
             if adx_dim.raw >= 0.5:
@@ -204,50 +302,85 @@ class MarketState:
                 self.regime = "Developing"
             else:
                 self.regime = "Choppy"
-        
-        # GEX regime
+
+        # gex_regime is likewise CONVICTION: `raw` is -1 Negative / +1 Positive,
+        # `normalized` is the unsigned multiplier (Negative gamma amplifies, so it
+        # scores HIGHER conviction). The label must read `raw`, not `normalized`.
         gex_dim = self.dimensions.get("gex_regime")
         if gex_dim:
-            self.gex_regime = "Positive" if gex_dim.normalized > 0 else "Negative" if gex_dim.normalized < 0 else "Unknown"
-    
+            if gex_dim.raw < 0:
+                self.gex_regime = "Negative"
+            elif gex_dim.raw > 0:
+                self.gex_regime = "Positive"
+            else:
+                self.gex_regime = "Unknown"
+
     # ──────────────────────────────────────────────────────────────────────────
     # QUERIES
     # ──────────────────────────────────────────────────────────────────────────
-    
+
     def get_category_bias(self, category: DimensionCategory) -> float:
-        """Get the net bias for a specific category."""
+        """
+        Net DIRECTIONAL bias for a category, in [-1, +1].
+
+        Only direction-channel dimensions are considered, so asking for the TREND
+        category no longer mixes ADX strength into a signed answer.
+        """
         score = 0.0
         weight_sum = 0.0
         for dim_name, dim_val in self.dimensions.items():
-            dim_def = DIMENSIONS.get(dim_name)
+            dim_def = DIRECTION_DIMENSIONS.get(dim_name)
             if not dim_def or dim_def.category != category or dim_def.weight == 0:
                 continue
             score += dim_val.normalized * dim_def.weight
             weight_sum += dim_def.weight
-        return score / max(1, weight_sum)
-    
+        return score / weight_sum if weight_sum > 0 else 0.0
+
+    def get_conviction_breakdown(self) -> dict[str, float]:
+        """Per-dimension contributions to the conviction multiplier."""
+        out: dict[str, float] = {}
+        for dim_name, dim_val in self.dimensions.items():
+            dim_def = CONVICTION_DIMENSIONS.get(dim_name)
+            if not dim_def or dim_def.weight == 0:
+                continue
+            v = dim_val.normalized
+            v = (v + 1.0) / 2.0 if v < 0 else min(1.0, v)
+            out[dim_name] = round(v, 3)
+        return out
+
     def get_strongest_signals(self, n: int = 5) -> list[tuple[str, float]]:
-        """Get the N dimensions with the strongest absolute signal."""
+        """The N directional dimensions with the strongest weighted signal."""
         scored = []
         for dim_name, dim_val in self.dimensions.items():
-            dim_def = DIMENSIONS.get(dim_name)
+            dim_def = DIRECTION_DIMENSIONS.get(dim_name)
             if not dim_def or dim_def.weight == 0:
                 continue
             strength = abs(dim_val.normalized) * dim_def.weight
             scored.append((dim_name, dim_val.normalized, strength))
         scored.sort(key=lambda x: x[2], reverse=True)
         return [(name, val) for name, val, _ in scored[:n]]
-    
+
     def get_contradictions(self) -> list[tuple[str, str]]:
-        """Find dimensions that contradict the net bias (potential warning signs)."""
-        direction = 1 if self.net_directional_bias >= 0 else -1
+        """
+        Directional dimensions that oppose the net read.
+
+        Restricted to the direction channel: a low ADX or a quiet tape is not a
+        "contradiction", it is low conviction, and conflating the two produced
+        counter-arguments with positive point values.
+        """
+        sign = 1 if self.direction_score >= 0 else -1
         contradictions = []
         for dim_name, dim_val in self.dimensions.items():
-            dim_def = DIMENSIONS.get(dim_name)
+            dim_def = DIRECTION_DIMENSIONS.get(dim_name)
             if not dim_def or dim_def.weight < 5:
-                continue  # Only flag important contradictions
-            if (dim_val.normalized > 0.3 and direction < 0) or (dim_val.normalized < -0.3 and direction > 0):
-                contradictions.append((dim_name, f"{'Bullish' if dim_val.normalized > 0 else 'Bearish'} ({dim_val.normalized:.2f}) contradicts net {'Bearish' if direction < 0 else 'Bullish'} bias"))
+                continue  # only flag materially weighted contradictions
+            if (dim_val.normalized > 0.3 and sign < 0) or (dim_val.normalized < -0.3 and sign > 0):
+                contradictions.append((
+                    dim_name,
+                    f"{'Bullish' if dim_val.normalized > 0 else 'Bearish'} "
+                    f"({dim_val.normalized:.2f}) contradicts net "
+                    f"{'Bearish' if sign < 0 else 'Bullish'} direction",
+                ))
         return contradictions
     
     def get_velocity_alerts(self, threshold: float = 0.3) -> list[tuple[str, float]]:
@@ -372,6 +505,9 @@ class MarketState:
             "market_open": self.market_open,
             "scan_number": self.scan_number,
             "net_bias": round(self.net_directional_bias, 1),
+            "direction_score": round(self.direction_score, 4),
+            "conviction_score": round(self.conviction_score, 4),
+            "conviction_breakdown": self.get_conviction_breakdown(),
             "agreement": round(self.agreement_factor, 3),
             "regime": self.regime,
             "gex_regime": self.gex_regime,
@@ -388,24 +524,31 @@ class MarketState:
     def to_compact(self) -> dict:
         """Compact representation for AI prompts (minimize tokens)."""
         direction = "BULLISH" if self.net_directional_bias > 5 else "BEARISH" if self.net_directional_bias < -5 else "NEUTRAL"
-        
-        # Only include dimensions that are significantly non-zero
-        active_dims = {}
+
+        # Split the active dimensions by channel so a reader can never mistake a
+        # conviction or context reading for a directional one.
+        active_dir: dict[str, float] = {}
+        active_conv: dict[str, float] = {}
         for name, dv in self.dimensions.items():
-            if abs(dv.normalized) >= 0.2:
-                dim_def = DIMENSIONS.get(name)
-                if dim_def and dim_def.weight >= 4:
-                    active_dims[name] = round(dv.normalized, 2)
-        
+            dim_def = DIMENSIONS.get(name)
+            if not dim_def or dim_def.weight < 4:
+                continue
+            if dim_def.channel is Channel.DIRECTION and abs(dv.normalized) >= 0.2:
+                active_dir[name] = round(dv.normalized, 2)
+            elif dim_def.channel is Channel.CONVICTION:
+                active_conv[name] = round(dv.normalized, 2)
+
         return {
             "instrument": self.instrument,
             "bias": direction,
             "net_score": round(self.net_directional_bias, 1),
-            "confidence_input": round(abs(self.net_directional_bias) * 0.62 + self.agreement_factor * 42, 0),
+            "direction_score": round(self.direction_score, 3),
+            "conviction_score": round(self.conviction_score, 3),
             "regime": self.regime,
             "gex": self.gex_regime,
             "agreement": round(self.agreement_factor * 100, 0),
-            "key_dimensions": active_dims,
+            "direction_dimensions": active_dir,
+            "conviction_dimensions": active_conv,
             "velocity_alerts": [(n, round(v, 3)) for n, v in self.get_velocity_alerts()[:3]],
         }
     

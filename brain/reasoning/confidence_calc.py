@@ -1,17 +1,33 @@
 """
 SignalsBrain — Confidence Calculator
 
-Not a simple formula. A Bayesian-inspired multi-stage calculation:
+Confidence is now computed as an exact sum of attributed contributions:
 
-Stage 1: BASE confidence from net directional bias × agreement
-Stage 2: REGIME modifier (ADX trending boosts, choppy penalizes)
-Stage 3: GEX modifier (distance-scaled, not blind)
-Stage 4: HISTORICAL modifier (pattern memory win rate)
-Stage 5: VELOCITY modifier (fast-changing dimensions = something happening)
-Stage 6: MULTI-TF modifier (higher TF alignment)
-Stage 7: EVIDENCE QUALITY (how many strong evidence pieces do we have?)
+    confidence = sum(per-dimension points) + agreement_points + external_points
 
-Each stage is auditable — the AI model sees exactly what contributed what.
+Three defects this replaces:
+
+1. **Non-causal explanation.** The old implementation accepted the evidence list
+   but never summed `confidence_impact`; it only counted items. Perturbing any
+   impact by any amount left the score unchanged (measured delta: 0.00). The
+   displayed reasoning was therefore unrelated to the number.
+
+2. **Double counting.** Stage 2 added up to +8 for "Trending", but `adx_regime`
+   (w8) and `adx_value` (w7) were already inside net_bias. Stage 3 added up to
+   +8 for the GEX regime, already present via `gex_regime` (w10) and
+   `gex_flip_distance` (w9). Stage 6 added up to +7 for higher-timeframe
+   agreement, already present via `htf_trend` (w7). Best case summed to 130 and
+   was then clamped to 99, discarding 31 points of headroom.
+
+   Those stages are gone. Regime, GEX and MTF each speak exactly once, through
+   their own dimension — ADX and GEX now via the conviction multiplier, HTF via
+   the direction channel.
+
+3. **Saturation.** With everything favourable the old score pinned at 99 for any
+   net_bias >= 60, making the top 40% of the range indistinguishable and the
+   number useless for ranking or position sizing. The score is now unbounded
+   below 100 by construction and is additionally exposed as a calibrated
+   probability (see calibration.py) rather than an arbitrary 0-99 figure.
 """
 
 from __future__ import annotations
@@ -19,65 +35,161 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .evidence_chain import Evidence, EvidenceWeight, EvidenceDirection
+from .attribution import (
+    Attribution, Contribution, attribute, conviction_attribution,
+    DIRECTION_POINTS, AGREEMENT_POINTS,
+)
+from ..state.market_state import MarketState
 
 
 @dataclass
 class ConfidenceBreakdown:
-    """Shows exactly where each point of confidence came from."""
+    """
+    Where every point came from.
+
+    The legacy stage fields are retained (and reported as 0.0) so existing
+    consumers and serialised payloads keep the same shape, with an explicit note
+    that the stage no longer exists.
+    """
     base: float = 0.0
     base_explanation: str = ""
-    
+
+    # Retained for payload compatibility; always 0.0 now.
     regime_modifier: float = 0.0
-    regime_explanation: str = ""
-    
+    regime_explanation: str = "folded into the conviction multiplier (no longer double counted)"
     gex_modifier: float = 0.0
-    gex_explanation: str = ""
-    
+    gex_explanation: str = "folded into the conviction multiplier (no longer double counted)"
+    mtf_modifier: float = 0.0
+    mtf_explanation: str = "counted once via the htf_trend direction dimension"
+    velocity_modifier: float = 0.0
+    velocity_explanation: str = "velocity is reported per dimension, not re-added"
+    evidence_quality_modifier: float = 0.0
+    evidence_quality_explanation: str = "superseded by exact attribution"
+
     historical_modifier: float = 0.0
     historical_explanation: str = ""
-    
-    velocity_modifier: float = 0.0
-    velocity_explanation: str = ""
-    
-    mtf_modifier: float = 0.0
-    mtf_explanation: str = ""
-    
-    evidence_quality_modifier: float = 0.0
-    evidence_quality_explanation: str = ""
 
+    # Data-quality discount. This is NOT double counting: it prices the absence
+    # of inputs, which no dimension can express (a missing dimension contributes
+    # zero, which is indistinguishable from a genuinely neutral reading).
     coverage_modifier: float = 0.0
     coverage_explanation: str = ""
-    
+
+    agreement_points: float = 0.0
+    direction_points: float = 0.0
+    conviction_multiplier: float = 0.0
+
     penalty_total: float = 0.0
     bonus_total: float = 0.0
-    
     final: float = 0.0
-    
+
+    attribution: Optional[Attribution] = None
+    conviction_detail: list[Contribution] = field(default_factory=list)
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "base": {"value": round(self.base, 1), "reason": self.base_explanation},
-            "regime": {"value": round(self.regime_modifier, 1), "reason": self.regime_explanation},
-            "gex": {"value": round(self.gex_modifier, 1), "reason": self.gex_explanation},
-            "historical": {"value": round(self.historical_modifier, 1), "reason": self.historical_explanation},
-            "velocity": {"value": round(self.velocity_modifier, 1), "reason": self.velocity_explanation},
-            "mtf": {"value": round(self.mtf_modifier, 1), "reason": self.mtf_explanation},
-            "evidence_quality": {"value": round(self.evidence_quality_modifier, 1), "reason": self.evidence_quality_explanation},
-            "coverage": {"value": round(self.coverage_modifier, 1), "reason": self.coverage_explanation},
+            "regime": {"value": 0.0, "reason": self.regime_explanation},
+            "gex": {"value": 0.0, "reason": self.gex_explanation},
+            "historical": {"value": round(self.historical_modifier, 1),
+                           "reason": self.historical_explanation},
+            "velocity": {"value": 0.0, "reason": self.velocity_explanation},
+            "mtf": {"value": 0.0, "reason": self.mtf_explanation},
+            "evidence_quality": {"value": 0.0, "reason": self.evidence_quality_explanation},
+            "coverage": {"value": round(self.coverage_modifier, 1),
+                         "reason": self.coverage_explanation},
+            "direction_points": round(self.direction_points, 2),
+            "agreement_points": round(self.agreement_points, 2),
+            "conviction_multiplier": round(self.conviction_multiplier, 3),
             "final": round(self.final, 1),
         }
+        if self.attribution is not None:
+            d["attribution"] = self.attribution.to_dict()
+            d["reconciles"] = self.attribution.verify(1e-4)
+        if self.conviction_detail:
+            d["conviction_detail"] = [c.to_dict() for c in self.conviction_detail]
+        return d
 
 
 class ConfidenceCalculator:
-    """
-    Multi-stage confidence calculation with full audit trail.
-    """
-    
+    """Additive, fully attributable confidence."""
+
+    def calculate_from_state(
+        self,
+        state: MarketState,
+        direction: str,
+        historical_modifier: float = 0.0,
+        historical_explanation: str = "",
+        coverage: Optional[float] = None,
+    ) -> ConfidenceBreakdown:
+        """
+        Primary entry point. Confidence is the attributed sum, nothing else.
+        """
+        cov = state.quality.coverage if coverage is None else coverage
+        cov = max(0.0, min(1.0, cov))
+        coverage_penalty = -20.0 * (1.0 - cov)
+
+        att = attribute(
+            state,
+            direction,
+            external_points=historical_modifier + coverage_penalty,
+            external_reason=(
+                f"{historical_explanation or 'no historical data'}; "
+                f"coverage {cov:.0%} ({coverage_penalty:+.1f})"
+            ),
+        )
+        bd = ConfidenceBreakdown()
+        bd.attribution = att
+        bd.conviction_detail = conviction_attribution(state)
+        bd.direction_points = att.direction_points
+        bd.agreement_points = att.agreement_points
+        bd.conviction_multiplier = att.conviction_multiplier
+        bd.historical_modifier = historical_modifier
+        bd.historical_explanation = historical_explanation or "no historical data"
+        bd.coverage_modifier = coverage_penalty
+        bd.coverage_explanation = (
+            f"State coverage {cov:.0%}; incomplete inputs reduce confidence "
+            f"({coverage_penalty:.1f})"
+        )
+
+        bd.base = att.direction_points + att.agreement_points
+        bd.base_explanation = (
+            f"direction {att.direction_points:+.1f} pts "
+            f"(|dir| {abs(state.direction_score):.3f} x conviction "
+            f"{state.conviction_score:.3f} x {DIRECTION_POINTS:.0f}) "
+            f"+ agreement {att.agreement_points:.1f} pts "
+            f"({state.agreement_factor:.0%} x {AGREEMENT_POINTS:.0f})"
+        )
+
+        bd.bonus_total = (sum(c.points for c in att.contributions if c.points > 0)
+                          + max(0.0, historical_modifier))
+        bd.penalty_total = (sum(c.points for c in att.contributions if c.points < 0)
+                            + min(0.0, historical_modifier) + coverage_penalty)
+
+        # Clamp only at the hard bounds of the reporting scale. There is no
+        # interior ceiling, so distinct states keep distinct scores.
+        bd.final = max(0.0, min(100.0, att.total))
+        # If the clamp actually binds, fold the difference into the external term
+        # so the reported decomposition still reconciles with the reported score.
+        if abs(bd.final - att.total) > 1e-9:
+            base_sum = sum(c.points for c in att.contributions) + att.agreement_points
+            att.external_points = bd.final - base_sum
+            att.external_reason = (
+                f"{historical_explanation or 'external'} "
+                f"(adjusted for the 0-100 reporting clamp)"
+            )
+            att.total = bd.final
+        return bd
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Backwards-compatible shim
+    # ──────────────────────────────────────────────────────────────────────────
+
     def calculate(
         self,
         net_bias: float,
         agreement: float,
-        evidence: list[Evidence],
+        evidence: list = None,
         regime: str = "Unknown",
         gex_regime: str = "Unknown",
         gex_flip_distance_atr: float = 999,
@@ -87,136 +199,35 @@ class ConfidenceCalculator:
         coverage: float = 1.0,
     ) -> ConfidenceBreakdown:
         """
-        Calculate confidence with full breakdown.
-        
-        Args:
-            net_bias: Net directional score [-100, +100]
-            agreement: Fraction of dimensions agreeing (0-1)
-            evidence: All evidence pieces collected
-            regime: Market regime (Trending/Developing/Choppy)
-            gex_regime: GEX regime (Positive/Negative)
-            gex_flip_distance_atr: Distance to GEX flip in ATR units
-            historical_modifier: From pattern memory
-            historical_explanation: Why that modifier
-            htf_aligned: Higher TF agrees with signal direction?
-        """
-        bd = ConfidenceBreakdown()
-        
-        # ── Stage 1: BASE ─────────────────────────────────────────────────────
-        # Same formula as the live site: |net| × 0.62 + agreement × 42
-        bd.base = min(99, abs(net_bias) * 0.62 + agreement * 42)
-        bd.base_explanation = f"|net_bias| {abs(net_bias):.0f} × 0.62 + agreement {agreement:.0%} × 42 = {bd.base:.0f}"
-        
-        # ── Stage 2: REGIME ───────────────────────────────────────────────────
-        if regime == "Trending":
-            # In a trend, directional signals are more reliable
-            bd.regime_modifier = 8
-            bd.regime_explanation = f"Trending market (ADX high): directional signals have strong edge (+8)"
-        elif regime == "Developing":
-            bd.regime_modifier = 3
-            bd.regime_explanation = f"Developing trend: moderate directional edge (+3)"
-        elif regime == "Choppy":
-            bd.regime_modifier = -10
-            bd.regime_explanation = f"Choppy market (ADX low): directional signals unreliable (-10)"
-        else:
-            bd.regime_modifier = 0
-            bd.regime_explanation = "Unknown regime: no adjustment"
-        
-        # ── Stage 3: GEX (distance-scaled) ────────────────────────────────────
-        dist = abs(gex_flip_distance_atr)
-        if gex_regime == "Negative":
-            # Negative Gamma = dealers amplify. Always good for directional trades.
-            bd.gex_modifier = 8
-            bd.gex_explanation = "Negative Gamma — dealers amplify moves, favorable for momentum (+8)"
-        elif gex_regime == "Positive":
-            if dist <= 1.0:
-                # Transition zone — regime can flip any moment
-                bd.gex_modifier = 4
-                bd.gex_explanation = f"Positive Gamma but within 1 ATR of flip ({dist:.1f}). Transition zone — explosive potential (+4)"
-            elif dist <= 2.0:
-                bd.gex_modifier = -3
-                bd.gex_explanation = f"Positive Gamma, {dist:.1f} ATR from flip. Mild dealer suppression (-3)"
-            elif dist <= 4.0:
-                bd.gex_modifier = -6
-                bd.gex_explanation = f"Positive Gamma, {dist:.1f} ATR from flip. Significant dealer suppression (-6)"
-            else:
-                bd.gex_modifier = -10
-                bd.gex_explanation = f"Positive Gamma, {dist:.1f} ATR from flip. Dealers firmly in control (-10)"
-        else:
-            bd.gex_modifier = 0
-            bd.gex_explanation = "No GEX data: no adjustment"
-        
-        # ── Stage 4: HISTORICAL ───────────────────────────────────────────────
-        bd.historical_modifier = historical_modifier
-        bd.historical_explanation = historical_explanation or "No historical data"
-        
-        # ── Stage 5: VELOCITY ─────────────────────────────────────────────────
-        # If multiple dimensions are changing fast in the same direction = conviction
-        velocity_evidence = [e for e in evidence if e.factor.startswith("VELOCITY_")]
-        if len(velocity_evidence) >= 3:
-            # Multiple dimensions shifting simultaneously — regime shift in progress
-            bd.velocity_modifier = 8
-            bd.velocity_explanation = f"{len(velocity_evidence)} dimensions shifting rapidly — regime transition detected (+8)"
-        elif len(velocity_evidence) >= 1:
-            bd.velocity_modifier = 3
-            bd.velocity_explanation = f"{len(velocity_evidence)} dimension(s) with high velocity — something building (+3)"
-        else:
-            bd.velocity_modifier = 0
-            bd.velocity_explanation = "No significant velocity — stable state"
-        
-        # ── Stage 6: MULTI-TF ─────────────────────────────────────────────────
-        if htf_aligned is True:
-            bd.mtf_modifier = 7
-            bd.mtf_explanation = "Higher timeframe (1H) CONFIRMS signal direction (+7)"
-        elif htf_aligned is False:
-            bd.mtf_modifier = -8
-            bd.mtf_explanation = "Higher timeframe CONTRADICTS signal direction (-8)"
-        else:
-            bd.mtf_modifier = 0
-            bd.mtf_explanation = "No higher-TF data"
-        
-        # ── Stage 7: EVIDENCE QUALITY ─────────────────────────────────────────
-        # How many CRITICAL/HIGH weight evidence pieces support the direction?
-        critical_count = sum(1 for e in evidence if e.weight in (EvidenceWeight.CRITICAL, EvidenceWeight.HIGH) and e.confidence_impact > 0)
-        counter_count = sum(1 for e in evidence if e.weight in (EvidenceWeight.CRITICAL, EvidenceWeight.HIGH) and e.confidence_impact < 0)
-        
-        if critical_count >= 4 and counter_count == 0:
-            bd.evidence_quality_modifier = 6
-            bd.evidence_quality_explanation = f"{critical_count} strong confirmations, 0 strong contradictions — conviction (+6)"
-        elif critical_count >= 3:
-            bd.evidence_quality_modifier = 3
-            bd.evidence_quality_explanation = f"{critical_count} strong factors confirm ({counter_count} counter) (+3)"
-        elif counter_count >= 3:
-            bd.evidence_quality_modifier = -6
-            bd.evidence_quality_explanation = f"{counter_count} strong counter-arguments — conflicting evidence (-6)"
-        else:
-            bd.evidence_quality_modifier = 0
-            bd.evidence_quality_explanation = "Mixed evidence quality: no adjustment"
-        
-        # ── Stage 8: STATE COVERAGE ──────────────────────────────────────────
-        coverage = max(0.0, min(1.0, coverage))
-        bd.coverage_modifier = -20.0 * (1.0 - coverage)
-        bd.coverage_explanation = (
-            f"State coverage {coverage:.0%}; incomplete inputs reduce confidence "
-            f"({bd.coverage_modifier:.1f})"
-        )
+        Legacy signature, retained so older callers keep working.
 
-        # ── FINAL CALCULATION ─────────────────────────────────────────────────
-        bd.bonus_total = sum(x for x in [
-            bd.regime_modifier, bd.gex_modifier, bd.historical_modifier,
-            bd.velocity_modifier, bd.mtf_modifier, bd.evidence_quality_modifier,
-            bd.coverage_modifier,
-        ] if x > 0)
-        
-        bd.penalty_total = sum(x for x in [
-            bd.regime_modifier, bd.gex_modifier, bd.historical_modifier,
-            bd.velocity_modifier, bd.mtf_modifier, bd.evidence_quality_modifier,
-            bd.coverage_modifier,
-        ] if x < 0)
-        
-        bd.final = max(0, min(99, bd.base + bd.regime_modifier + bd.gex_modifier +
-                              bd.historical_modifier + bd.velocity_modifier +
-                              bd.mtf_modifier + bd.evidence_quality_modifier +
-                              bd.coverage_modifier))
-        
+        It no longer applies the regime / GEX / MTF / velocity / evidence-count
+        stages, because each of those double counted a dimension already present
+        in `net_bias`. The result is the additive core only:
+
+            |net_bias|/100 * 62 + agreement * 38 + historical_modifier
+
+        Prefer `calculate_from_state`, which also returns the exact per-dimension
+        attribution.
+        """
+        cov = max(0.0, min(1.0, coverage))
+        coverage_penalty = -20.0 * (1.0 - cov)
+        bd = ConfidenceBreakdown()
+        bd.direction_points = abs(net_bias) / 100.0 * DIRECTION_POINTS
+        bd.agreement_points = agreement * AGREEMENT_POINTS
+        bd.historical_modifier = historical_modifier
+        bd.historical_explanation = historical_explanation or "no historical data"
+        bd.coverage_modifier = coverage_penalty
+        bd.coverage_explanation = (
+            f"State coverage {cov:.0%}; incomplete inputs reduce confidence "
+            f"({coverage_penalty:.1f})"
+        )
+        bd.base = bd.direction_points + bd.agreement_points
+        bd.base_explanation = (
+            f"|net_bias| {abs(net_bias):.0f}/100 x {DIRECTION_POINTS:.0f} "
+            f"+ agreement {agreement:.0%} x {AGREEMENT_POINTS:.0f}"
+        )
+        bd.bonus_total = max(0.0, historical_modifier)
+        bd.penalty_total = min(0.0, historical_modifier) + coverage_penalty
+        bd.final = max(0.0, min(100.0, bd.base + historical_modifier + coverage_penalty))
         return bd

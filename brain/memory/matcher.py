@@ -28,6 +28,7 @@ from typing import Optional
 from ..state.market_state import MarketState
 from .pattern_db import PatternDB, PatternStats
 from .fingerprint import build_categorical_fingerprint
+from .statistics import wilson_interval, two_proportion_z
 
 
 @dataclass
@@ -65,6 +66,15 @@ class HistoricalContext:
     current_regime_win_rate: float = 0.0
     current_regime_note: str = ""
     
+    # Which instrument the statistics came from. Always the requested one now;
+    # exposed so a consumer can see there was no cross-instrument substitution.
+    instrument_scope: str = ""
+
+    # Uncertainty on the win rate, so a caller can never see a bare point estimate.
+    win_rate_ci_lower: float = 0.0
+    win_rate_ci_upper: float = 0.0
+    win_rate_ci_note: str = ""
+
     # Narrative (human-readable summary for AI models)
     narrative: str = ""
     
@@ -83,9 +93,13 @@ class HistoricalContext:
         if self.similar_setups == 0:
             return "PATTERN MEMORY: No similar historical setups found (new pattern or insufficient data)."
         
+        wr = (f"{self.win_rate:.0f}%"
+              f" [{self.win_rate_ci_lower:.0f}-{self.win_rate_ci_upper:.0f}% 95% CI]"
+              if self.win_rate_ci_note else f"{self.win_rate:.0f}%")
         lines = [
-            f"PATTERN MEMORY ({self.similar_setups} similar setups found):",
-            f"  Win rate: {self.win_rate:.0f}% | Avg move: {self.avg_move_atr:.1f} ATR in {self.avg_duration_min:.0f} min",
+            f"PATTERN MEMORY ({self.similar_setups} similar setups"
+            f"{f', {self.instrument_scope} only' if self.instrument_scope else ''}):",
+            f"  Win rate: {wr} | Avg move: {self.avg_move_atr:.1f} ATR in {self.avg_duration_min:.0f} min",
             f"  T1 hit: {self.hit_t1_rate:.0f}% | T2: {self.hit_t2_rate:.0f}% | T3: {self.hit_t3_rate:.0f}% | SL: {self.stop_loss_rate:.0f}%",
             f"  P&L range: best +{self.best_pnl_pct:.0f}%, worst {self.worst_pnl_pct:.0f}%, avg {self.avg_pnl_pct:.0f}%",
         ]
@@ -114,7 +128,8 @@ class PatternMatcher:
     def __init__(self, db: PatternDB):
         self.db = db
     
-    def get_context(self, state: MarketState, direction: str) -> HistoricalContext:
+    def get_context(self, state: MarketState, direction: str,
+                    as_of: Optional[float] = None) -> HistoricalContext:
         """
         Get full historical context for a signal being evaluated.
         This is called by the ReasoningEngine for every signal.
@@ -122,11 +137,14 @@ class PatternMatcher:
         ctx = HistoricalContext()
         
         # Get pattern stats
-        stats = self.db.get_pattern_stats(state, direction, instrument=state.instrument)
-        
-        if stats.total_trades == 0:
-            # Try without instrument filter (cross-instrument patterns)
-            stats = self.db.get_pattern_stats(state, direction)
+        # Instrument-scoped only. The previous fallback silently re-queried
+        # without the instrument filter, so BANKNIFTY ATR-normalised moves and
+        # premium P&L could be presented to the model as NIFTY history. Options
+        # on different underlyings have different lot sizes, strike steps, IV
+        # regimes and liquidity; mixing them is not a conservative default.
+        stats = self.db.get_pattern_stats(state, direction,
+                                          instrument=state.instrument, as_of=as_of)
+        ctx.instrument_scope = state.instrument
         
         if stats.total_trades == 0:
             ctx.narrative = "No historical data for this pattern yet. The brain is learning — outcomes will be recorded."
@@ -150,8 +168,15 @@ class PatternMatcher:
         matches = self.db.find_similar(state, direction, min_match=0.75, limit=100, instrument=state.instrument)
         ctx.exact_matches = len(matches)
         
-        # Confidence adjustment based on historical win rate
+        # Confidence adjustment based on historical win rate, gated on the
+        # Wilson interval rather than the point estimate.
         ctx.confidence_modifier, ctx.confidence_reason = self._confidence_adjustment(stats)
+        if stats.total_trades > 0:
+            _wins = int(round(stats.win_rate / 100.0 * stats.total_trades))
+            _est = wilson_interval(_wins, stats.total_trades, 0.95)
+            ctx.win_rate_ci_lower = _est.lower * 100.0
+            ctx.win_rate_ci_upper = _est.upper * 100.0
+            ctx.win_rate_ci_note = _est.describe()
         
         # Degradation check
         ctx.is_degrading = stats.is_degrading
@@ -182,30 +207,56 @@ class PatternMatcher:
         
         return ctx
     
+    # Break-even win rate after costs. Below this a pattern loses money.
+    BREAKEVEN_WR = 0.55
+    # Minimum completed trades before history may ADD confidence. A +/-10 point
+    # interval at p=0.5 needs ~96 samples; 30 is the pragmatic floor at which the
+    # Wilson lower bound starts to be informative.
+    MIN_SAMPLES_FOR_BOOST = 30
+
     def _confidence_adjustment(self, stats: PatternStats) -> tuple[float, str]:
         """
-        Calculate confidence modifier from historical data.
-        
-        High win rate → boost confidence (pattern has edge)
-        Low win rate → reduce confidence (pattern is unreliable)
-        Too few samples → no adjustment (insufficient evidence)
+        Confidence modifier from history, gated on the interval rather than the
+        point estimate.
+
+        Previously 9 wins from 12 trades produced +8.0 with the message "Strong
+        historical edge (75% win rate, 12 trades)". The 95% binomial interval for
+        9/12 spans roughly 45%-92% — from "loses money after costs" to
+        "excellent" — so that +8 was noise presented as edge. The only guard was
+        n < 10.
+
+        Now:
+          * a positive adjustment requires n >= 30 AND a lower bound above
+            break-even, so the edge must be statistically distinguishable;
+          * a negative adjustment only needs the UPPER bound to be below
+            break-even, because being wrong about a bad pattern is cheap;
+          * the reported reason always carries the interval.
         """
-        if stats.total_trades < 10:
-            return 0.0, "Insufficient history (<10 trades) — no adjustment"
-        
-        # Baseline: 55% win rate = break-even after costs. Below = negative edge.
-        if stats.win_rate >= 75:
-            return 8.0, f"Strong historical edge ({stats.win_rate:.0f}% win rate, {stats.total_trades} trades)"
-        elif stats.win_rate >= 65:
-            return 5.0, f"Good historical edge ({stats.win_rate:.0f}% WR)"
-        elif stats.win_rate >= 55:
-            return 2.0, f"Mild positive edge ({stats.win_rate:.0f}% WR)"
-        elif stats.win_rate >= 45:
-            return -3.0, f"Near break-even historically ({stats.win_rate:.0f}% WR) — marginal"
-        elif stats.win_rate >= 35:
-            return -8.0, f"Below break-even historically ({stats.win_rate:.0f}% WR) — caution"
-        else:
-            return -15.0, f"LOSING pattern historically ({stats.win_rate:.0f}% WR) — strong avoid"
+        n = stats.total_trades
+        if n == 0:
+            return 0.0, "No completed trades for this pattern"
+
+        wins = int(round(stats.win_rate / 100.0 * n))
+        est = wilson_interval(wins, n, confidence=0.95)
+        desc = est.describe()
+
+        # Penalise when the whole interval sits below break-even.
+        if est.upper < self.BREAKEVEN_WR:
+            severity = -15.0 if est.upper < 0.35 else -8.0
+            return severity, f"Interval entirely below break-even: {desc}"
+
+        if n < self.MIN_SAMPLES_FOR_BOOST:
+            return 0.0, (f"Insufficient history for a positive adjustment "
+                         f"(n={n} < {self.MIN_SAMPLES_FOR_BOOST}): {desc}")
+
+        # Reward only a lower bound that clears break-even.
+        if est.lower >= 0.70:
+            return 8.0, f"Strong edge, lower bound clears 70%: {desc}"
+        if est.lower >= 0.62:
+            return 5.0, f"Good edge, lower bound clears 62%: {desc}"
+        if est.lower >= self.BREAKEVEN_WR:
+            return 2.0, f"Mild edge, lower bound clears break-even: {desc}"
+        return 0.0, f"Edge not distinguishable from break-even: {desc}"
     
     def _generate_warnings(self, stats: PatternStats, state: MarketState) -> list[str]:
         """Generate specific warnings from historical data."""
