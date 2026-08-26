@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .pattern_db import PatternDB
+from .option_pricing import realised_pnl_pct, implied_pnl_pct
 
 
 @dataclass
@@ -49,10 +50,18 @@ class ActiveTrade:
     t2_spot: float = 0.0
     t3_spot: float = 0.0
     
+    # Pricing inputs, so P&L can be modelled when no premium quote is observed.
+    iv_at_entry: float = 0.0
+    dte_at_entry: float = 0.0
+
     # State
     t1_hit: bool = False
     t2_hit: bool = False
     highest_premium: float = 0.0  # High-water mark for trailing
+    # Maximum favourable / adverse excursion, in ATR units. Needed to judge
+    # partial-target behaviour instead of only the final label.
+    mfe_atr: float = 0.0
+    mae_atr: float = 0.0
     
     def __post_init__(self):
         mul = 1 if self.direction == "BUY" else -1
@@ -83,7 +92,8 @@ class OutcomeTracker:
                        entry_spot: float, entry_premium: float, strike: float,
                        opt_type: str, atr: float, entry_time: Optional[float] = None,
                        t1_hit: bool = False, t2_hit: bool = False,
-                       highest_premium: Optional[float] = None):
+                       highest_premium: Optional[float] = None,
+                       iv_at_entry: float = 0.0, dte_at_entry: float = 0.0):
         """Begin tracking a new trade for outcome."""
         trade = ActiveTrade(
             signal_id=signal_id,
@@ -95,6 +105,8 @@ class OutcomeTracker:
             opt_type=opt_type,
             atr=atr,
             entry_time=entry_time if entry_time is not None else time.time(),
+            iv_at_entry=iv_at_entry,
+            dte_at_entry=dte_at_entry,
             t1_hit=t1_hit,
             t2_hit=t2_hit,
             highest_premium=entry_premium if highest_premium is None else highest_premium,
@@ -147,13 +159,35 @@ class OutcomeTracker:
                 move_atr = move / trade.atr if trade.atr > 0 else 0
                 duration = (time.time() - trade.entry_time) / 60
                 
-                pnl_pct = 0.0
-                if current_premium and trade.entry_premium > 0:
-                    pnl_pct = ((current_premium - trade.entry_premium) / trade.entry_premium) * 100
-                elif trade.entry_premium > 0:
-                    # Estimate: premium gain roughly proportional to spot move
-                    pnl_pct = move_atr * 80  # Rough: 1 ATR move ≈ 80% premium gain for ATM
-                
+                # P&L priority: observed premiums, then a Black-Scholes mark,
+                # then None. The old `move_atr * 80` proxy claimed a 1 ATR move
+                # was worth +80% and a 3.2 ATR move +256%, ignoring delta,
+                # gamma, theta, vega, strike and IV. Because tracking started
+                # with entry_premium=0, that proxy was what actually reached the
+                # database and became the "realised" P&L in every statistic.
+                pnl_pct = realised_pnl_pct(trade.entry_premium, current_premium)
+                pnl_source = "observed"
+                if pnl_pct is None:
+                    pnl_pct = implied_pnl_pct(
+                        entry_spot=trade.entry_spot,
+                        exit_spot=current_spot,
+                        strike=trade.strike or trade.entry_spot,
+                        opt_type=trade.opt_type or ("CE" if trade.direction == "BUY" else "PE"),
+                        iv_pct_entry=getattr(trade, "iv_at_entry", 0.0) or 0.0,
+                        dte_days_entry=getattr(trade, "dte_at_entry", 0.0) or 0.0,
+                        minutes_held=duration,
+                    )
+                    pnl_source = "modelled"
+                if pnl_pct is None:
+                    # Unknown stays unknown. The row is recorded for audit but
+                    # excluded from statistics rather than being invented.
+                    pnl_source = "unavailable"
+
+                # Reclassify on realised P&L: touching a level is not banking a
+                # win. A non-positive result cannot be a WIN_*.
+                if pnl_pct is not None and outcome.startswith("WIN") and pnl_pct <= 0:
+                    outcome = "SCRATCH"
+
                 # Record in pattern memory
                 self._record_outcome(
                     signal_id=sid,
@@ -163,6 +197,7 @@ class OutcomeTracker:
                     move_atr=move_atr,
                     duration_min=duration,
                     pnl_pct=pnl_pct,
+                    pnl_source=pnl_source,
                 )
                 
                 triggered.append({
@@ -171,7 +206,8 @@ class OutcomeTracker:
                     "outcome": outcome,
                     "move_atr": round(move_atr, 2),
                     "duration_min": round(duration, 1),
-                    "pnl_pct": round(pnl_pct, 1),
+                    "pnl_pct": None if pnl_pct is None else round(pnl_pct, 1),
+                    "pnl_source": pnl_source,
                 })
                 to_remove.append(sid)
         
@@ -217,7 +253,20 @@ class OutcomeTracker:
         return triggered
     
     def _check_trade(self, trade: ActiveTrade, spot: float) -> Optional[str]:
-        """Check if a trade hit any target or stop."""
+        """
+        Classify a trade's outcome from the spot path.
+
+        Note on labelling: reaching a target level is not the same as banking a
+        win. Previously, price touching T1 and then round-tripping all the way
+        back to entry was booked as WIN_T1 — and because P&L was computed at the
+        entry-level premium the row scored a small positive number, which
+        `get_pattern_stats` then counted as a win. On a real option a 45-minute
+        round trip is a theta loss. Every such path inflated the reported win
+        rate.
+
+        A round trip to entry is now SCRATCH, and the final win/loss call is made
+        on realised premium P&L net of costs, not on spot touching a level.
+        """
         is_buy = trade.direction == "BUY"
         
         # Stop loss
@@ -261,12 +310,13 @@ class OutcomeTracker:
                 trade.t1_hit = True
             return None
         
-        # If T1 was hit but price came back to entry → book as WIN_T1 (breakeven+)
+        # T1 was reached and price has round-tripped back to entry. This is a
+        # SCRATCH, not a win: the spot gain was given back, and the option has
+        # meanwhile paid theta for the whole holding period.
         if trade.t1_hit:
-            # After T1, if it falls back to entry → exit at breakeven (technically a small win)
             back_to_entry = abs(spot - trade.entry_spot) / trade.atr
-            if back_to_entry < 0.1:  # Within 0.1 ATR of entry
-                return "WIN_T1"
+            if back_to_entry < 0.1:
+                return "SCRATCH"
         
         return None  # Still in play
     

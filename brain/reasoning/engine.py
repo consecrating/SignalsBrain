@@ -64,6 +64,7 @@ class ReasoningEngine:
         live_premium_cost: float = 0,
         capital: float = 200000,
         confidence_threshold: float = 60,
+        as_of: Optional[float] = None,
     ) -> EvidenceChain:
         """
         Produce a complete reasoning chain for the current market state.
@@ -88,7 +89,11 @@ class ReasoningEngine:
         # ── Step 3: Get historical context ────────────────────────────────────
         hist_ctx = HistoricalContext()
         if self.pattern_matcher and direction != "NO_TRADE":
-            hist_ctx = self.pattern_matcher.get_context(state, direction)
+            # `as_of` enforces the walk-forward guard: statistics may only be
+            # drawn from trades that had already resolved when this signal fired.
+            hist_ctx = self.pattern_matcher.get_context(
+                state, direction, as_of=as_of if as_of is not None else state.timestamp
+            )
         
         # ── Step 4: Calculate confidence (multi-stage) ────────────────────────
         gex_flip_dist = 999.0
