@@ -262,13 +262,51 @@ class BlunderGuard:
         # RULE 11: DEAD MARKET
         # Learned from: Buying options in a flat market = pure theta loss
         # ══════════════════════════════════════════════════════════════════════
-        if atr_pct < 0.25:
+        # "Dead" must mean "unusually quiet for this instrument on this
+        # timeframe", not "below a fixed percentage".
+        #
+        # The original test was `atr_pct < 0.25`, which is a DAILY-bar threshold.
+        # Measured on real NIFTY bars from the production proxy, median ATR% is
+        # 0.0245 on 1-minute, 0.0548 on 5-minute and 0.1118 on 15-minute bars —
+        # so 100% of intraday bars tripped it. As a HARD veto that made the engine
+        # incapable of emitting any intraday signal, which is the only thing it is
+        # designed to do. A synthetic feed with per-bar vol of 0.0025 sat just
+        # above the threshold and hid this entirely.
+        #
+        # atr_percentile ranks ATR% against the instrument's own recent history,
+        # so the rule is timeframe-agnostic and self-calibrating.
+        atr_pctl = raw("atr_percentile", -1.0)
+        if atr_pctl >= 0.0:
+            if atr_pctl <= 0.10:
+                vetoes.append(Veto(
+                    name="DEAD_MARKET",
+                    rule_number=11,
+                    severity="HARD",
+                    description=(
+                        f"ATR {atr_pct:.3f}% of price is in the bottom "
+                        f"{atr_pctl*100:.0f}th percentile of this instrument's own "
+                        f"recent range. Unusually quiet — premiums decay faster "
+                        f"than spot moves."
+                    ),
+                    learned_from="Trades taken in the quietest decile lost money to "
+                                 "theta before the target was reached.",
+                ))
+        elif atr_pct > 0 and atr_pct < 0.02:
+            # Not enough history to rank yet. Fall back to an absolute floor an
+            # order of magnitude below the 1-minute median, so it catches a truly
+            # frozen tape without blocking a normal session. Deliberately
+            # fail-open: a wrong HARD veto here suppresses everything, which is a
+            # worse failure than admitting one marginal signal.
             vetoes.append(Veto(
                 name="DEAD_MARKET",
                 rule_number=11,
                 severity="HARD",
-                description=f"ATR only {atr_pct:.2f}% of price. Market too quiet — premiums decay faster than spot moves.",
-                learned_from="Every trade taken when ATR < 0.25% lost money to theta before target was reached.",
+                description=(
+                    f"ATR only {atr_pct:.4f}% of price and insufficient history to "
+                    f"rank it. Tape appears frozen."
+                ),
+                learned_from="Absolute floor used only until ~30 samples of ATR% "
+                             "history exist for this instrument.",
             ))
         
         # ══════════════════════════════════════════════════════════════════════

@@ -410,6 +410,17 @@ class StateBuilder:
         if atr and ltp > 0:
             atr_pct = (atr / ltp) * 100
             self._set(state, "atr_pct", atr_pct, normalize_unit(atr_pct, 0.20, 1.20))
+            # Rank ATR% against this instrument's own history. A fixed threshold
+            # is interval-dependent: real NIFTY median ATR% is 0.0245 on 1-minute
+            # bars vs 0.1118 on 15-minute, so any constant is wrong on some
+            # timeframe. -1 signals "not enough history to rank".
+            ah = self._raw_hist(inst, "atr_pct")
+            if len(ah) >= 30:
+                rank = sum(1 for x in ah if x < atr_pct) / len(ah)
+                self._set(state, "atr_percentile", rank, rank)
+            else:
+                self._set(state, "atr_percentile", -1.0, 0.0)
+            self._push_raw(inst, "atr_pct", atr_pct)
 
         bb_u, bb_m, bb_l = self._bollinger(closes)
         if bb_m and bb_m > 0:

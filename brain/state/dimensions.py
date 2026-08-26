@@ -186,6 +186,9 @@ _d("gex_regime", DimensionCategory.OPTIONS, Channel.CONVICTION,
 _d("ltp", DimensionCategory.PRICE, Channel.CONTEXT, "Last traded price (absolute)", 0, vel=False)
 _d("sr_proximity", DimensionCategory.PRICE, Channel.CONTEXT,
    "Unsigned distance to nearest swing S/R in ATR units", 4, vel=False)
+_d("atr_percentile", DimensionCategory.VOLATILITY, Channel.CONTEXT,
+   "ATR% ranked against this instrument's own recent history (0-1). Timeframe-"
+   "agnostic liveness gate; a fixed ATR% threshold is interval-dependent.", 0, vel=False)
 _d("gex_net", DimensionCategory.OPTIONS, Channel.CONTEXT,
    "Net GEX magnitude (Rs Cr) — size of dealer exposure", 6)
 _d("gex_flip_distance", DimensionCategory.OPTIONS, Channel.CONTEXT,
