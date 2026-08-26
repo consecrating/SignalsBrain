@@ -62,7 +62,28 @@ class BlunderGuard:
             return d.normalized if d else default
         
         gex_regime = state.gex_regime
-        session_min = raw("session_minutes", 120)
+
+        # StateBuilder stores -1 for session_minutes when the market is shut.
+        # Previously session_minutes was clamped with max(0, ...), so every
+        # pre-open moment looked like "minute 0" and tripped OPENING_CHAOS as a
+        # HARD veto. That made the engine incapable of emitting a signal outside
+        # 09:30-15:15 IST, which in turn made backtesting and pattern-memory
+        # seeding impossible. Now "market closed" is its own explicit state.
+        session_min = raw("session_minutes", -1.0)
+        market_closed = (not state.market_open) or session_min < 0
+
+        if market_closed:
+            vetoes.append(Veto(
+                name="MARKET_CLOSED",
+                rule_number=0,
+                severity="HARD",
+                description="Market is closed (outside 09:15-15:30 IST on a weekday). "
+                            "No new entries.",
+                learned_from="Structural: there is no liquidity to trade against.",
+            ))
+            # Session-phase rules are meaningless with no session; skip them and
+            # evaluate only the state-based rules below.
+            session_min = None
         adx = raw("adx_value", 20)
         atr_pct = raw("atr_pct", 0.5)
         rsi = raw("rsi", 50)
@@ -88,7 +109,7 @@ class BlunderGuard:
         # RULE 2: LATE SESSION (extended to 3:15 PM per user request)
         # Learned from: Theta crush + illiquidity in last 15 minutes
         # ══════════════════════════════════════════════════════════════════════
-        if session_min >= 360:  # 3:15 PM = 09:15 + 360 min
+        if session_min is not None and session_min >= 360:  # 3:15 PM = 09:15 + 360 min
             vetoes.append(Veto(
                 name="LATE_SESSION",
                 rule_number=2,
@@ -143,7 +164,7 @@ class BlunderGuard:
         # RULE 5: OPENING CHAOS (first 15 minutes)
         # Learned from: Gap fills and fake moves in first 15 min
         # ══════════════════════════════════════════════════════════════════════
-        if session_min <= 15:
+        if session_min is not None and session_min <= 15:
             vetoes.append(Veto(
                 name="OPENING_CHAOS",
                 rule_number=5,

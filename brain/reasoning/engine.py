@@ -101,16 +101,15 @@ class ReasoningEngine:
         if htf_dim and htf_dim.normalized != 0 and direction != "NO_TRADE":
             htf_aligned = (htf_dim.normalized > 0 and direction == "BUY") or (htf_dim.normalized < 0 and direction == "SELL")
         
-        conf_breakdown = self.confidence_calc.calculate(
-            net_bias=net,
-            agreement=state.agreement_factor,
-            evidence=all_evidence,
-            regime=state.regime,
-            gex_regime=state.gex_regime,
-            gex_flip_distance_atr=gex_flip_dist,
+        # Exact attribution: confidence is the sum of the per-dimension
+        # contributions plus agreement plus the external terms. The evidence
+        # chain below explains the same arithmetic that produced this number,
+        # instead of running a second, decorative calculation alongside it.
+        conf_breakdown = self.confidence_calc.calculate_from_state(
+            state=state,
+            direction=direction,
             historical_modifier=hist_ctx.confidence_modifier,
             historical_explanation=hist_ctx.confidence_reason,
-            htf_aligned=htf_aligned,
             coverage=state.quality.coverage,
         )
         confidence = conf_breakdown.final
