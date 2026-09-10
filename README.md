@@ -1,8 +1,29 @@
 # SignalsBrain — God Mode
 
+> **Status: mostly dormant. Read [STATUS.md](STATUS.md) first.**
+>
+> This service is **not deployed and nothing calls it.** The live trading site contains no
+> reference to any `/brain/*` endpoint or to port 8400. The only part in real use is
+> `brain/validation/`, which runs offline and produces the committed
+> `validation-summary.json` that the site's dashboard reads.
+>
+> The God Mode that actually trades is a **separate JavaScript implementation** in
+> `Signals-Live-Website/js/god-mode.js`. It is not a client of this service. Where the two
+> disagree, the JavaScript is what runs.
+>
+> Everything below describes the intended design, and the API examples describe a server you
+> would have to stand up yourself. Treat them as a specification, not as a description of
+> something currently running.
+
 **47-dimension market intelligence for Indian F&O. Connect any AI model.**
 
-A reasoning intelligence layer that processes what no human expert can: 47 market dimensions simultaneously, with velocity tracking, pattern memory across thousands of historical setups, and multi-model AI consensus — all in under 5 milliseconds.
+A reasoning intelligence layer designed to process 47 market dimensions simultaneously, with
+velocity tracking, pattern memory across historical setups, and multi-model AI consensus.
+
+Note on the "47 dimensions" claim, since it is measurable: the live JavaScript implementation
+populates roughly 10 of the 47, and its dimension-weight table feeds evidence classification
+for display rather than the confidence score itself. The Python state builder here does
+implement the full set, but it does not execute.
 
 ---
 
